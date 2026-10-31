@@ -128,6 +128,9 @@ Measured on the same 8 HK-DS3 meetings:
 - 11-second warm request: 62.81 ms → **60.15 ms**.
 - Live 250 ms / 250 ms: stable concurrency increased from 12 to **14**
   streams per die (15 starts failing).
+- Across all 8 files, the fully optimized service (OMP=16 + skip-mask) took
+  **48.67 s** versus **87.26 s** for the original OMP=1 service (**1.79×**
+  combined); this is not the skip-mask delta alone.
 
 ## Conclusion
 

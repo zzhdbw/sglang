@@ -210,7 +210,7 @@ Throughput changes on one tuned 310P3 (`OMP_NUM_THREADS=16`):
 | 11.0 s upload, warm mean | 62.81 ms | **60.15 ms** | 1.04× |
 | 51.6 min upload, mean | 14.84 s | **11.87 s** | **1.25×** |
 | 51.6 min realtime factor | 208.7× | **260.8×** | +25% |
-| 8-file service time total | 87.26 s | **48.67 s** | 1.79× |
+| 8-file total, default OMP=1 vs fully optimized | 87.26 s | **48.67 s** | 1.79× combined |
 
 Live 250 ms / 250 ms, 60-second 310P3 test:
 
