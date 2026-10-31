@@ -92,11 +92,16 @@ class SpeakerCache:
             (math.floor(frames_per_speaker * 1.5), 1),
         ]:
             indices = torch.topk(scores, boosted_frames, dim=1, sorted=False).indices
-            scores[
-                torch.arange(batch, device=scores.device)[:, None, None],
-                indices,
-                torch.arange(speakers, device=scores.device)[None, None, :],
-            ] -= boost_scale * math.log(0.5)
+            # Ascend 310P's AI CPU fallbacks for index_put and scatter_ fail
+            # for the three-dimensional index tensors produced by topk.  Build
+            # the same selection with broadcast equality and torch.where.
+            frame_positions = torch.arange(
+                scores.shape[1], device=scores.device
+            ).view(1, 1, -1, 1)
+            selected = (indices.unsqueeze(2) == frame_positions).any(dim=1)
+            scores = torch.where(
+                selected, scores - boost_scale * math.log(0.5), scores
+            )
         # note (Ryan Stewart): One silence frame per speaker, then speaker-major order.
         scores = torch.cat(
             [scores, scores.new_full((batch, 1, speakers), float("inf"))], dim=1

@@ -30,7 +30,12 @@ but its diarization path was CUDA-only.  This fork changes:
    - uses `torch.get_device_module(device)` for NPU/CUDA streams and events.
 4. `models/nemotron_diarization/streaming.py`
    - keeps cache tensors alive on the active accelerator stream generically.
-5. Added NPU config, install/run scripts, and verification clients.
+5. `models/nemotron_diarization/speaker_cache.py`
+   - replaces the three-dimensional advanced-index assignment in speaker-cache
+     compression, which fails in the 310P AI CPU `Index`/`ScatterElements`
+     kernels, with an equivalent broadcast-mask + `torch.where` selection;
+   - this makes recordings longer than one offline window work reliably.
+6. Added NPU config, install/run scripts, and verification clients.
 
 ## Validated environment
 
@@ -90,9 +95,7 @@ Expected shape of the API result:
 ```
 
 The first inference in a new process performs CANN operator initialization and
-is slower.  Subsequent requests are much faster; after warmup the upload
-endpoint returned an 11-second recording in about 0.08–0.09 seconds on the
-validated machine.
+is slower.  Subsequent requests are much faster; see the benchmark section.
 
 ## Start the server
 
@@ -139,17 +142,53 @@ Both endpoints were validated with an 11-second mono 16 kHz PCM16 WAV.
   tests/unit_test/serve/test_diarizations.py -q
 ```
 
-Validated result: `46 passed`.
+Validated result: `47 passed`.
+
+## Throughput benchmark
+
+Measured on one Ascend 310P3 with the warmed `offline` profile through
+`POST /v1/audio/diarizations`.  Audio was 16 kHz mono PCM16.
+
+| Audio duration | Requests | Mean latency | RTF | Single-stream throughput |
+| --- | ---: | ---: | ---: | ---: |
+| 11.0 s | 29 warm requests | 66.85 ms | 0.0061 | 164.6× real time, ~898 req/min |
+| 111.8 s | 5 requests | 692.1 ms | 0.0062 | 161.5× real time, ~86.7 req/min |
+
+The first request after server startup was slower (about 1.7 s for the 11 s
+file) due to one-time CANN operator initialization.
+
+Concurrent HTTP benchmark with 111.8 s recordings:
+
+| Concurrent clients | Wall time | Aggregate throughput |
+| ---: | ---: | ---: |
+| 2 | 1.35 s | 165.7× real time |
+| 4 | 2.66 s | 167.8× real time |
+| 8 | 5.31 s | 168.6× real time |
+
+The default diarization factory has `max_concurrency=1`, so concurrent clients
+queue and latency grows roughly linearly.  Aggregate audio throughput stays
+near 166–169× real time.  Increase `--diarization.factory.max_concurrency` only
+after validating NPU stream concurrency on the target CANN version.
+
+NPU memory used by the diarization stage during the benchmark was about
+717 MiB for the worker plus about 100 MiB for the launcher process.
+
+Benchmark caveat: the repeated-speaker JFK sample measures compute throughput,
+not diarization quality.  DER/accuracy should be evaluated on representative
+multi-speaker recordings.
 
 ## Known limitations
 
 - This is not an NVIDIA-supported CUDA configuration.  The CUDA path still
   exists but was not performance-tuned here; the fork favors correctness on
   Ascend 310P.
-- Only one NPU is used for a diarization server by default.  Multiple server
-  processes can be bound to different devices for parallelism.
+- Only one NPU is used for a diarization server process.  Multiple server
+  processes can be bound to different devices for parallelism.  The built-in
+  diarization factory defaults to `max_concurrency=1`.
 - The STFT feature extractor runs on the host CPU because complex STFT is not
   available on 310P.  The ~100M parameter encoder/head stays on NPU.
 - FP32 is the validated precision.  Do not expect BF16 support on 310P.
+- The throughput numbers above use repeated single-speaker audio; multi-speaker
+  audio with more speaker-turn post-processing may differ slightly.
 - No speaker embedding/identification is performed; the model only returns
   anonymous speaker turns.
