@@ -77,3 +77,60 @@ serving; production remains `max_concurrency=1`.
 - 51.6-minute service time: **~9.7 s**
 - 8-file service total: **~41.0 s**
 - Aggregate DER: **34.8009%** collar=0, **30.2840%** collar=0.25
+
+## Can STFT run on the NPU?
+
+Direct eager STFT/FFT is not available on 310P:
+
+```text
+torch.stft / torch.fft.rfft / torch.fft.fft
+RuntimeError: Current settings do not support Complex dtype.
+```
+
+All three fail because these APIs produce complex tensors and the current
+310P torch_npu eager backend does not support complex dtype.
+
+A real-valued DFT implemented as NPU matmuls is possible:
+
+```text
+real = frames @ cos_table
+imag = frames @ sin_table
+magnitude = sqrt(real^2 + imag^2)
+mel = magnitude^2 @ mel_filter
+```
+
+Measured on a 111.8-second audio sample:
+
+| Implementation | Time |
+| --- | ---: |
+| CPU STFT/Mel, OMP=16 | 72.7 ms |
+| NPU real-DFT matmul, excluding H2D | 297.1 ms |
+
+The NPU real-DFT path is roughly 4× slower and would consume the NPU cycles
+that are already the main bottleneck.  With the current CPU/NPU overlap, host
+STFT is mostly hidden, so moving STFT to the NPU is not beneficial.
+
+## Current concurrency
+
+Single 310P3, 250 ms upload / 250 ms interval, 60-second sessions, ACK
+backpressure:
+
+| Streams | Result |
+| ---: | --- |
+| 12 | stable |
+| 14 | stable, no errors, p95 ACK lag ~0.90 s |
+| 15 | queue-full / connection failures begin |
+
+Recommended operating point: **12 realtime streams per die**.
+Measured hard limit: **14 realtime streams per die**.
+
+For offline batch requests, the production service uses
+`max_concurrency=1`.  A test instance with `max_concurrency=2` completed two
+long requests in 20.41 s versus 23.13 s sequential (1.13× aggregate), but
+single-request latency increased substantially.  The recommended defaults are:
+
+- low latency: `max_concurrency=1`
+- throughput-oriented batch: `max_concurrency=2`
+
+With all eight 310P3 dies dedicated and one service per die, the extrapolated
+realtime capacity is about **96 recommended / 112 hard-limit streams**.
