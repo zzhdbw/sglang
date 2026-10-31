@@ -177,6 +177,48 @@ Benchmark caveat: the repeated-speaker JFK sample measures compute throughput,
 not diarization quality.  DER/accuracy should be evaluated on representative
 multi-speaker recordings.
 
+## Live concurrency: 250 ms uploaded every 250 ms
+
+This is the more relevant capacity metric for realtime audio.  Each WebSocket
+stream sends one 250 ms PCM16 message every 250 ms, i.e. one full realtime
+audio stream per connection.  Tests used one 310P3, `max_concurrency=1`,
+`max_live_sessions=64`, and ran for 60 seconds per configuration.
+
+| Concurrent streams | Errors | p95 ack lag | Max ack lag | Result |
+| ---: | ---: | ---: | ---: | --- |
+| 8 | 0 / 8 | 0.51 s | 0.84 s | stable, recommended |
+| 10 | 0 / 10 | 1.00 s | 1.61 s | ceiling, still no drops |
+| 11 | 4 / 11 | 1.95 s | 2.24 s | client sessions dropped |
+| 12 | 4 / 12 | 1.83 s | 2.23 s | client sessions dropped |
+
+Interpretation for one 310P3 die:
+
+- **Recommended: 8 concurrent realtime streams**
+- **Measured ceiling: about 10 concurrent realtime streams**
+- Above 10, the per-session 8-message (2 s) audio queue starts filling and the
+  server eventually closes sessions.
+- Raising `max_concurrency` to 4 did not help and made results worse on this
+  CANN/torch_npu version; keep `max_concurrency=1` unless separately tuned.
+
+The full 300I Duo host exposes 8 × 310P3 dies.  With one server process pinned
+to each die, the first-order host capacity is therefore:
+
+- **Recommended: about 8 × 8 = 64 concurrent realtime streams**
+- **Measured ceiling: about 8 × 10 = 80 concurrent realtime streams**
+
+This assumes all dies are free and each server process is independently
+configured with enough `max_live_sessions` and admission slots.  The default
+factory value is only `max_live_sessions=8`, so a single default server exposes
+8 live sessions.
+
+Run the benchmark with:
+
+```bash
+.venv/bin/python benchmarks/npu/live_250ms_concurrency.py /tmp/jfk_10x.wav \
+  --url ws://127.0.0.1:18086/v1/audio/diarizations/stream \
+  --streams 8 --seconds 60
+```
+
 ## Known limitations
 
 - This is not an NVIDIA-supported CUDA configuration.  The CUDA path still
@@ -190,5 +232,8 @@ multi-speaker recordings.
 - FP32 is the validated precision.  Do not expect BF16 support on 310P.
 - The throughput numbers above use repeated single-speaker audio; multi-speaker
   audio with more speaker-turn post-processing may differ slightly.
+- The live-concurrency ceiling is dominated by per-250 ms request scheduling and
+  queueing on the current single-worker diarization factory, not by raw model
+  FLOPs.  Larger deployments should use one process per NPU die.
 - No speaker embedding/identification is performed; the model only returns
   anonymous speaker turns.
