@@ -222,6 +222,22 @@ Live 250 ms / 250 ms, 60-second 310P3 test:
 The practical live ceiling improved from about **12** to about **14** streams
 per 310P3 die.
 
+### Precision sweep
+
+Direct model throughput and aggregate DER over the 8-meeting set:
+
+| Mode | Realtime factor | DER0 | Δ DER0 | DER25 | Δ DER25 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FP32 | 309.3× | 34.801% | — | 30.284% | — |
+| FP16 whole model | 441.8× | 37.732% | +2.93 pp | 33.472% | +3.19 pp |
+| Mixed attention/MLP FP16 | 355.1× | 35.075% | +0.27 pp | 30.693% | +0.41 pp |
+| torch_npu AMP | 377.6× | 35.765% | +0.96 pp | 31.341% | +1.06 pp |
+
+Manual mixed attention/MLP FP16 is the best aggregate speed/accuracy
+trade-off, but it regresses `AIPC` by 3.37 pp, so the production service
+remains FP32 + skip-mask.  See
+[`benchmarks/npu/PRECISION_SWEEP_NEMOTRON_DIARIZATION.md`](./benchmarks/npu/PRECISION_SWEEP_NEMOTRON_DIARIZATION.md).
+
 ### Throughput after OMP tuning
 
 Measured on the tuned instance with `OMP_NUM_THREADS=16` and
