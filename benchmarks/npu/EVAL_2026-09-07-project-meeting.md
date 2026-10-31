@@ -13,10 +13,14 @@
 
 | Path | Hardware | Precision | Processing time | RTF | Speed |
 | --- | --- | --- | ---: | ---: | ---: |
-| SGLang-Omni HTTP service | 1× Ascend 310P3 | FP32 | 21.85 s | 0.00706 | 141.7× realtime |
-| HF Transformers | CPU, 96 threads requested | FP32 | 1145.14 s model forward | 0.3698 | 2.70× realtime |
+| SGLang-Omni HTTP service | 1× Ascend 310P3 | FP32 | 19.96 s | 0.00645 | 155.1× realtime |
+| HF Transformers | CPU, 32 threads | FP32 | 61.09 s model forward | 0.01973 | 50.7× realtime |
 
-NPU service speedup over CPU Transformers: **52.4×**.
+NPU service speedup over CPU Transformers: **3.06×**.
+
+> The initial CPU run used 96 PyTorch threads on a 96-core host and suffered
+> severe thread oversubscription (1145 s).  Re-running with 32 threads produced
+> the representative 61.09 s result above; the DER output was unchanged.
 
 The CPU baseline used `transformers==5.22.1`,
 `AutoModelForAudioFrameClassification`, `attn_implementation="eager"`, FP32.
