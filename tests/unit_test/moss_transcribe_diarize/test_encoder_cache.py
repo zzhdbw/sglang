@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+pytest.importorskip("sglang")
+
+from sglang_omni.models.moss_transcribe_diarize import sglang_model  # noqa: E402
+
+_ENCODER_CACHE_MAX_ENTRIES = (
+    sglang_model._ENCODER_CACHE_MAX_ENTRIES
+)  # noqa: leading-underscore  # production name
+MossModel = sglang_model.MossTranscribeDiarizeForConditionalGeneration
+
+
+def make_model(max_bytes: int) -> MossModel:
+    model = MossModel.__new__(MossModel)
+    torch.nn.Module.__init__(model)
+    model.vq_adaptor = torch.nn.Linear(4, 4)
+    model.init_encoder_cache(max_bytes)
+    return model
+
+
+def stub_encode(model: MossModel):
+    calls = {"count": 0}
+
+    def fake(items, forward_batch):  # noqa: ANN001
+        calls["count"] += 1
+        return torch.ones(4)
+
+    model.get_audio_feature_uncached = fake  # type: ignore[assignment]
+    return calls
+
+
+def item(audio_hash: int) -> SimpleNamespace:
+    return SimpleNamespace(hash=audio_hash)
+
+
+def test_identical_hash_encodes_once() -> None:
+    model = make_model(max_bytes=1 << 20)
+    calls = stub_encode(model)
+
+    first = model.get_audio_feature([item(123)], forward_batch=None)
+    second = model.get_audio_feature([item(123)], forward_batch=None)
+
+    assert calls["count"] == 1
+    assert torch.equal(first, second)
+
+
+def test_different_hash_encodes_each() -> None:
+    model = make_model(max_bytes=1 << 20)
+    calls = stub_encode(model)
+
+    model.get_audio_feature([item(1)], forward_batch=None)
+    model.get_audio_feature([item(2)], forward_batch=None)
+
+    assert calls["count"] == 2
+
+
+def test_disabled_cache_always_encodes() -> None:
+    model = make_model(max_bytes=0)
+    calls = stub_encode(model)
+
+    assert model.encoder_cache is None
+    model.get_audio_feature([item(7)], forward_batch=None)
+    model.get_audio_feature([item(7)], forward_batch=None)
+
+    assert calls["count"] == 2
+
+
+def test_multi_item_batch_bypasses_cache() -> None:
+    model = make_model(max_bytes=1 << 20)
+    calls = stub_encode(model)
+
+    model.get_audio_feature([item(1), item(2)], forward_batch=None)
+    model.get_audio_feature([item(1), item(2)], forward_batch=None)
+
+    assert calls["count"] == 2
+
+
+def test_lru_evicts_when_over_budget() -> None:
+    model = make_model(max_bytes=16)
+    calls = stub_encode(model)
+
+    model.get_audio_feature([item(1)], forward_batch=None)
+    model.get_audio_feature([item(2)], forward_batch=None)
+    model.get_audio_feature([item(1)], forward_batch=None)
+
+    assert calls["count"] == 3
+    assert model.encoder_cache is not None
+    assert model.encoder_cache.eviction_count >= 1
+
+
+def test_entry_count_cap_matches_constant() -> None:
+    model = make_model(max_bytes=1 << 30)
+    assert model.encoder_cache is not None
+    assert model.encoder_cache.max_size == _ENCODER_CACHE_MAX_ENTRIES
+
+
+def test_hit_returns_model_device_tensors() -> None:
+    model = make_model(max_bytes=1 << 20)
+    stub_encode(model)
+    expected_device = next(model.vq_adaptor.parameters()).device
+
+    model.get_audio_feature([item(42)], forward_batch=None)
+    cached = model.get_audio_feature([item(42)], forward_batch=None)
+
+    assert cached.device == expected_device

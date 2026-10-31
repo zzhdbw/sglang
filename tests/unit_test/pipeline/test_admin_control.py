@@ -1,0 +1,609 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import asyncio
+import queue
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from sglang_omni.pipeline.control_plane import deserialize_message, serialize_message
+from sglang_omni.pipeline.coordinator import Coordinator
+from sglang_omni.pipeline.stage.runtime import Stage
+from sglang_omni.proto import (
+    AdminMessage,
+    AdminOperation,
+    AdminResult,
+    AdminResultMessage,
+    parse_message,
+)
+from tests.unit_test.fixtures.pipeline_fakes import (
+    FakeRelay,
+    FakeScheduler,
+    RecordingCoordinatorControlPlane,
+    RecordingStageControlPlane,
+)
+
+
+class AdminScheduler(FakeScheduler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, dict]] = []
+        self.tp_rank = 0
+
+    def admin(self, action: str, payload: dict):
+        self.calls.append((action, payload))
+        return {"success": True, "message": "ok", "data": {"action": action}}
+
+
+def test_admin_messages_round_trip() -> None:
+    op = AdminOperation(
+        op_id="op-1",
+        action="model_info",
+        payload={"x": 1},
+        target_stages=["decode"],
+        timeout_s=12.5,
+    )
+    msg = AdminMessage(op)
+
+    decoded = deserialize_message(serialize_message(msg))
+
+    assert isinstance(decoded, AdminMessage)
+    assert decoded.operation.op_id == "op-1"
+    assert decoded.operation.payload == {"x": 1}
+
+    result = AdminResultMessage(
+        AdminResult(
+            op_id="op-1",
+            stage="decode",
+            action="model_info",
+            success=True,
+            data={"model_path": "m"},
+        )
+    )
+    parsed = parse_message(result.to_dict())
+    assert isinstance(parsed, AdminResultMessage)
+    assert parsed.result.data["model_path"] == "m"
+
+
+def test_omni_scheduler_admin_enqueues_to_scheduler_thread() -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.running = True
+    scheduler.tp_size = 1
+    scheduler.admin_queue = queue.Queue()
+    scheduler.scheduler_thread_id = None
+
+    ready = threading.Event()
+    done = threading.Event()
+    calls: list[tuple[int, str, dict]] = []
+
+    def run_admin_action(action: str, payload: dict) -> dict:
+        calls.append((threading.get_ident(), action, payload))
+        done.set()
+        return {"success": True, "data": {"thread": "scheduler"}}
+
+    scheduler.run_admin_action = run_admin_action
+
+    def scheduler_thread() -> None:
+        scheduler.scheduler_thread_id = threading.get_ident()
+        ready.set()
+        while not done.is_set():
+            OmniScheduler.process_admin_requests(scheduler)
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=scheduler_thread)
+    thread.start()
+    assert ready.wait(timeout=1.0)
+    caller_thread_id = threading.get_ident()
+
+    result = OmniScheduler.admin(
+        scheduler,
+        "model_info",
+        {"detail": True, "_admin_timeout_s": 1.0},
+    )
+
+    done.set()
+    thread.join(timeout=1.0)
+    assert result == {"success": True, "data": {"thread": "scheduler"}}
+    assert len(calls) == 1
+    scheduler_thread_id, action, payload = calls[0]
+    assert action == "model_info"
+    assert payload == {"detail": True}
+    assert scheduler_thread_id != caller_thread_id
+
+
+def test_omni_scheduler_update_weights_rejects_active_requests_by_default() -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    update_calls: list[dict] = []
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.model_worker = SimpleNamespace(
+        update_weights_from_disk=lambda payload: update_calls.append(payload)
+        or (True, "ok")
+    )
+    scheduler.admin_lock = threading.Lock()
+    scheduler._engine_paused = False  # noqa: leading-underscore  # production name
+    scheduler.last_pause_mode = None
+    scheduler.async_pending = None
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: ["req-1"]
+
+    result = OmniScheduler.admin_update_weights_from_disk(
+        scheduler,
+        {
+            "model_path": "/tmp/new-model",
+            "flush_cache": False,
+            "abort_all_requests": False,
+        },
+    )
+
+    assert result["success"] is False
+    assert "active requests are present" in result["message"]
+    assert result["data"]["active_request_count"] == 1
+    assert (
+        scheduler._engine_paused is False
+    )  # noqa: leading-underscore  # production name
+    assert result["data"]["engine_paused"] is False
+    assert update_calls == []
+
+
+def test_omni_scheduler_weights_checker_compare_change_is_success() -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.admin_lock = threading.Lock()
+    scheduler.model_worker = SimpleNamespace(
+        weights_checker=lambda action: {
+            "action": action,
+            "matched": False,
+            "changed": ["weight"],
+        }
+    )
+    result = OmniScheduler.admin_weights_checker(scheduler, {"action": "compare"})
+    assert result["success"] is True
+    assert result["data"]["matched"] is False
+    assert result["data"]["changed"] == ["weight"]
+
+
+@pytest.mark.parametrize(
+    ("admin_method", "worker_method", "payload"),
+    [
+        pytest.param(
+            "admin_update_weights_from_disk",
+            "update_weights_from_disk",
+            {"model_path": "/tmp/new-model", "torch_empty_cache": True},
+            id="disk",
+        ),
+    ],
+)
+def test_omni_scheduler_weight_updates_flush_and_advance_epoch(
+    admin_method: str, worker_method: str, payload: dict
+) -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    update_calls: list[dict] = []
+    flush_calls = 0
+    empty_cache_calls = 0
+
+    def update_weights(payload: dict) -> tuple[bool, str]:
+        update_calls.append(dict(payload))
+        return True, "ok"
+
+    def flush_cache() -> bool:
+        nonlocal flush_calls
+        flush_calls += 1
+        return True
+
+    def empty_torch_cache() -> None:
+        nonlocal empty_cache_calls
+        empty_cache_calls += 1
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.model_worker = SimpleNamespace(**{worker_method: update_weights})
+    scheduler.admin_lock = threading.Lock()
+    scheduler._engine_paused = False  # noqa: leading-underscore  # production name
+    scheduler.last_pause_mode = None
+    scheduler.async_pending = None
+    scheduler.request_admission_lock = threading.RLock()
+    scheduler.prompt_cache_epoch = 0
+    scheduler.waiting_queue = []
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: []
+    scheduler.flush_cache = flush_cache
+    scheduler.empty_torch_cache = empty_torch_cache
+
+    result = getattr(OmniScheduler, admin_method)(scheduler, payload)
+
+    assert result["success"] is True
+    assert result["data"]["flush_cache"] is True
+    assert result["data"]["flush_success"] is True
+    assert update_calls == [payload]
+    assert flush_calls == 1
+    assert empty_cache_calls == 1
+    assert scheduler.prompt_cache_epoch == 1
+
+
+def test_weight_swap_isolates_prompt_cache_when_flush_fails() -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    cache_key = "qwen3_tts:prompt:v1"
+    retracted = SimpleNamespace(
+        extra_key=f"{cache_key}:weights:0",
+        _omni_prompt_cache_key=cache_key,
+    )
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.model_worker = SimpleNamespace(
+        update_weights_from_disk=lambda _: (True, "swapped")
+    )
+    scheduler.admin_lock = threading.Lock()
+    scheduler.request_admission_lock = threading.RLock()
+    scheduler._engine_paused = True  # noqa: leading-underscore  # production name
+    scheduler.last_pause_mode = "retract"
+    scheduler.prompt_cache_epoch = 0
+    scheduler.waiting_queue = [retracted]
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: ["req-1"]
+    scheduler.flush_cache = lambda: False
+    scheduler.empty_torch_cache = lambda: None
+
+    result = OmniScheduler.admin_update_weights_from_disk(
+        scheduler, {"model_path": "/tmp/new-model"}
+    )
+
+    fresh = SimpleNamespace(extra_key=cache_key, _omni_prompt_cache_key=cache_key)
+    plain = SimpleNamespace(extra_key="plain")
+    scheduler.apply_prompt_cache_epoch(fresh)
+    scheduler.apply_prompt_cache_epoch(plain)
+    assert result["success"] is False
+    assert result["data"]["flush_success"] is False
+    assert result["data"]["engine_paused"] is True
+    assert retracted.extra_key == fresh.extra_key == f"{cache_key}:weights:1"
+    assert plain.extra_key == "plain"
+
+
+@pytest.mark.parametrize("failure_mode", ["return", "raise"])
+def test_tensor_update_failure_keeps_engine_paused(failure_mode: str) -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    def update_weights_from_tensor(payload: dict) -> tuple[bool, str]:
+        if failure_mode == "raise":
+            raise RuntimeError("partially updated")
+        return False, "partially updated"
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.model_worker = SimpleNamespace(
+        update_weights_from_tensor=update_weights_from_tensor
+    )
+    scheduler.admin_lock = threading.Lock()
+    scheduler._engine_paused = False  # noqa: leading-underscore  # production name
+    scheduler.last_pause_mode = None
+    scheduler.prompt_cache_epoch = 0
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: []
+
+    if failure_mode == "raise":
+        with pytest.raises(RuntimeError, match="partially updated"):
+            scheduler.admin_update_weights_from_tensor({})
+    else:
+        result = scheduler.admin_update_weights_from_tensor({})
+        assert result["success"] is False
+        assert result["data"]["engine_paused"] is True
+
+    assert (
+        scheduler._engine_paused is True
+    )  # noqa: leading-underscore  # production name
+    assert scheduler.prompt_cache_epoch == 0
+
+
+def test_omni_scheduler_flush_cache_has_upstream_idle_compat_fields() -> None:
+    from sglang.srt.runtime_context import get_context
+
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    class EmptyBatch:
+        reqs: list = []
+
+        def is_empty(self) -> bool:
+            return True
+
+    reset_calls: list[str] = []
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.device = "cuda"
+    scheduler.session_adapter = None
+    scheduler.tree_cache = SimpleNamespace(reset=lambda: reset_calls.append("tree"))
+    OmniScheduler.init_upstream_compat_flags(
+        scheduler,
+        SimpleNamespace(
+            enable_hisparse=False,
+            enable_priority_scheduling=False,
+            disable_priority_preemption=False,
+        ),
+    )
+    scheduler.running_batch = EmptyBatch()
+    scheduler.chunked_req = None
+    scheduler.last_batch = None
+    scheduler.cur_batch = None
+    scheduler.enable_overlap = False
+    scheduler.pp_size = 1
+    scheduler.waiting_queue = []
+    scheduler.grammar_manager = SimpleNamespace(
+        grammar_queue=[], clear=lambda: reset_calls.append("grammar")
+    )
+    scheduler.disaggregation_mode = None
+    scheduler.enable_hierarchical_cache = False
+    scheduler.enable_lmcache = False
+    scheduler._engine_paused = False  # noqa: leading-underscore  # production name
+    scheduler.req_to_token_pool = SimpleNamespace(
+        clear=lambda: reset_calls.append("req_pool"),
+        reset_aux_cache_allocator=lambda: reset_calls.append("aux_cache"),
+    )
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        clear=lambda: reset_calls.append("kv_pool")
+    )
+    scheduler.metrics_reporter = SimpleNamespace(
+        reset_metrics=lambda: reset_calls.append("metrics"),
+        is_stats_logging_rank=False,
+    )
+    scheduler.draft_worker = None
+
+    with get_context().override_server_args():
+        assert OmniScheduler.flush_cache_after_update(scheduler) is True
+    assert scheduler.device_module is not None
+    assert reset_calls == [
+        "tree",
+        "req_pool",
+        "kv_pool",
+        "aux_cache",
+        "grammar",
+        "metrics",
+    ]
+
+
+def test_omni_scheduler_abort_pause_ends_each_dropped_request() -> None:
+    from sglang_omni.admission import AdminDroppedRequestError
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    aborted: list[str] = []
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.admin_lock = threading.Lock()
+    scheduler._engine_paused = False  # noqa: leading-underscore  # production name
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: ["req-1", "req-2"]
+    scheduler.abort = lambda request_id, **_kwargs: aborted.append(request_id)
+    scheduler.running_batch = scheduler.cur_batch = scheduler.last_batch = None
+    scheduler.is_entry_rank = True
+    scheduler.outbox = queue.Queue()
+
+    result = OmniScheduler.admin_pause_generation(scheduler, {"mode": "abort"})
+
+    assert aborted == ["req-1", "req-2"]
+    assert result["data"]["num_paused_requests"] == 2
+    assert "aborted_request_ids" not in result["data"]
+    ended = [scheduler.outbox.get_nowait() for _ in range(2)]
+    assert [(msg.request_id, msg.type) for msg in ended] == [
+        ("req-1", "error"),
+        ("req-2", "error"),
+    ]
+    assert all(AdminDroppedRequestError.matches(msg.data) for msg in ended)
+
+
+def test_omni_scheduler_distributed_update_aborts_and_flushes_cache() -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    update_calls: list[dict] = []
+    flush_calls = 0
+    empty_cache_calls = 0
+    abort_calls = 0
+
+    def update_weights_from_distributed(payload: dict) -> tuple[bool, str]:
+        update_calls.append(dict(payload))
+        return True, "ok"
+
+    def flush_cache() -> bool:
+        nonlocal flush_calls
+        flush_calls += 1
+        return True
+
+    def empty_torch_cache() -> None:
+        nonlocal empty_cache_calls
+        empty_cache_calls += 1
+
+    def abort_all_requests() -> list[str]:
+        nonlocal abort_calls
+        abort_calls += 1
+        return ["req-1"]
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.model_worker = SimpleNamespace(
+        update_weights_from_distributed=update_weights_from_distributed
+    )
+    scheduler.admin_lock = threading.Lock()
+    scheduler._engine_paused = False  # noqa: leading-underscore  # production name
+    scheduler.last_pause_mode = None
+    scheduler.async_pending = None
+    scheduler.request_admission_lock = threading.RLock()
+    scheduler.prompt_cache_epoch = 0
+    scheduler.waiting_queue = []
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: ["req-1"]
+    scheduler.abort_all_requests = abort_all_requests
+    scheduler.flush_cache = flush_cache
+    scheduler.empty_torch_cache = empty_torch_cache
+
+    payload = {
+        "names": ["w.0"],
+        "dtypes": ["bfloat16"],
+        "shapes": [[2, 2]],
+        "group_name": "talker_group",
+        "abort_all_requests": True,
+        "torch_empty_cache": True,
+    }
+    result = OmniScheduler.admin_update_weights_from_distributed(scheduler, payload)
+
+    assert result["success"] is True
+    assert result["data"]["num_paused_requests"] == 1
+    assert result["data"]["flush_cache"] is True
+    assert result["data"]["flush_success"] is True
+    assert result["data"]["group_name"] == "talker_group"
+    assert result["data"]["names"] == ["w.0"]
+    assert update_calls == [payload]
+    assert abort_calls == 1
+    assert flush_calls == 1
+    assert empty_cache_calls == 1
+    assert scheduler.prompt_cache_epoch == 1
+
+
+def test_omni_scheduler_distributed_update_failure_keeps_engine_paused() -> None:
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    def update_weights_from_distributed(payload: dict) -> tuple[bool, str]:
+        return (
+            False,
+            "Failed to update parameter online: partially updated; discard weights",
+        )
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.model_worker = SimpleNamespace(
+        update_weights_from_distributed=update_weights_from_distributed
+    )
+    scheduler.admin_lock = threading.Lock()
+    scheduler._engine_paused = False  # noqa: leading-underscore  # production name
+    scheduler.last_pause_mode = None
+    scheduler.async_pending = None
+    scheduler.resolve_pending_async = lambda: None
+    scheduler.active_request_ids = lambda: []
+
+    result = OmniScheduler.admin_update_weights_from_distributed(
+        scheduler,
+        {
+            "names": ["w.0"],
+            "dtypes": ["bfloat16"],
+            "shapes": [[2, 2]],
+            "flush_cache": False,
+        },
+    )
+
+    assert result["success"] is False
+    assert "partially updated" in result["message"]
+    assert result["data"]["engine_paused"] is True
+    assert (
+        scheduler._engine_paused is True
+    )  # noqa: leading-underscore  # production name
+
+
+def test_coordinator_admin_waits_for_all_stage_results() -> None:
+    async def run() -> None:
+        coordinator = Coordinator(
+            "inproc://complete",
+            "inproc://abort",
+            entry_stage="preprocess",
+        )
+        control_plane = RecordingCoordinatorControlPlane()
+        coordinator.control_plane = control_plane
+        coordinator.running = True
+        coordinator.register_stage("decode", "inproc://decode")
+        coordinator.register_stage("vocoder", "inproc://vocoder")
+
+        task = asyncio.create_task(
+            coordinator.admin("model_info", {"detail": True}, timeout_s=1)
+        )
+        while len(control_plane.submitted) < 2:
+            await asyncio.sleep(0)
+
+        for stage, _, msg in control_plane.submitted:
+            assert isinstance(msg, AdminMessage)
+            coordinator.handle_admin_result(
+                AdminResult(
+                    op_id=msg.operation.op_id,
+                    stage=stage,
+                    action=msg.operation.action,
+                    success=True,
+                    data={"stage": stage},
+                )
+            )
+
+        result = await task
+        assert result["success"] is True
+        assert {item["stage"] for item in result["results"]} == {"decode", "vocoder"}
+
+    asyncio.run(run())
+
+
+def test_stage_admin_dispatches_to_scheduler() -> None:
+    async def run() -> None:
+        scheduler = AdminScheduler()
+        control_plane = RecordingStageControlPlane()
+        stage = Stage(
+            name="decode",
+            role="single",
+            get_next=lambda request_id, output: None,
+            gpu_id=None,
+            endpoints={},
+            control_plane=control_plane,
+            relay=FakeRelay(),
+            scheduler=scheduler,
+        )
+
+        await stage.on_admin(
+            AdminMessage(
+                AdminOperation(
+                    op_id="op-1",
+                    action="pause_generation",
+                    payload={"mode": "in_place"},
+                )
+            )
+        )
+
+        assert scheduler.calls == [("pause_generation", {"mode": "in_place"})]
+        result_msg = control_plane.completions[0]
+        assert isinstance(result_msg, AdminResultMessage)
+        assert result_msg.result.success is True
+        assert result_msg.result.data["action"] == "pause_generation"
+
+    asyncio.run(run())
+
+
+def test_omni_scheduler_model_info_adds_the_model_runner_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.scheduling import omni_scheduler
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    monkeypatch.setattr(
+        omni_scheduler,
+        "get_model",
+        lambda: SimpleNamespace(model_path="/ckpt", load_format="auto"),
+    )
+    monkeypatch.setattr(
+        omni_scheduler, "get_serving", lambda: SimpleNamespace(weight_version="v1")
+    )
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.model_worker = SimpleNamespace(
+        model_info=lambda: {"prefill_cuda_graph": {"replay_count": 3}}
+    )
+    scheduler.model_runner = SimpleNamespace(
+        model_info=lambda: {"predictor_cuda_graph": {"replays": 5}}
+    )
+    scheduler.request_admission_lock = threading.Lock()
+    scheduler.pending_request_builds = {}
+    scheduler.pending_request_admissions = {}
+    scheduler.backlogged_request_build_payloads = []
+    scheduler.waiting_queue = []
+    scheduler.tp_rank = 0
+    scheduler.tp_size = 1
+    scheduler._engine_paused = False  # noqa: leading-underscore  # production name
+    scheduler.request_build_max_workers = 1
+    scheduler.request_build_max_pending = 16
+    scheduler.request_build_max_pending_observed = 0
+    scheduler.running_batch = SimpleNamespace(reqs=[])
+
+    result = OmniScheduler.admin_model_info(scheduler)
+
+    assert result["data"]["prefill_cuda_graph"] == {"replay_count": 3}
+    assert result["data"]["predictor_cuda_graph"] == {"replays": 5}
+    assert result["data"]["weight_version"] == "v1"

@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from sglang_omni.models.ming_tts import engine_io
+from sglang_omni.models.ming_tts.engine_io import (
+    MingTTSLatentPatch,
+    MingTTSSGLangRequestData,
+    build_ming_tts_stream_output,
+    make_ming_tts_scheduler_adapters,
+)
+from sglang_omni.models.ming_tts.payload_types import MingTTSState
+from sglang_omni.proto import OmniRequest, StagePayload
+
+
+def make_payload() -> StagePayload:
+    state = MingTTSState(text="hello", input_ids=[1, 2, 3], max_decode_steps=2)
+    return StagePayload(
+        request_id="req-ming-tts",
+        request=OmniRequest(inputs="hello"),
+        data=state.to_dict(),
+    )
+
+
+def make_result_adapter(reset_request):
+    model = SimpleNamespace(patch_size=2, latent_dim=3)
+    _, result_adapter = make_ming_tts_scheduler_adapters(
+        model=model,
+        tokenizer=SimpleNamespace(),
+        reset_request=reset_request,
+    )
+    return result_adapter
+
+
+def request_data(
+    *,
+    generated_latents: torch.Tensor | None = None,
+    stop_step: int | None = None,
+    finish_reason=None,
+    req_finished_reason=None,
+) -> MingTTSSGLangRequestData:
+    return MingTTSSGLangRequestData(
+        req=SimpleNamespace(
+            output_ids=[],
+            finished_reason=req_finished_reason,
+        ),
+        state=MingTTSState(text="hello", input_ids=[1, 2, 3], max_decode_steps=2),
+        input_ids=torch.tensor([1, 2, 3], dtype=torch.long),
+        max_new_tokens=2,
+        generated_latents=generated_latents,
+        stop_step=stop_step,
+        finish_reason=finish_reason,
+        stage_payload=make_payload(),
+    )
+
+
+def test_ming_tts_result_adapter_serializes_empty_latent_output() -> None:
+    reset_requests = []
+
+    payload = make_result_adapter(reset_requests.append)(request_data())
+    restored = MingTTSState.from_dict(payload.data)
+    latents = restored.generated_latents
+
+    assert latents is not None
+    assert latents.shape == (0, 2, 3)
+    assert restored.completion_tokens == 0
+    assert restored.finish_reason == "stop"
+    assert reset_requests == ["req-ming-tts"]
+
+
+def test_ming_tts_result_adapter_prefers_stop_head_finish_reason() -> None:
+    data = request_data(
+        generated_latents=torch.ones(1, 2, 3),
+        stop_step=0,
+        finish_reason="length",
+    )
+
+    payload = make_result_adapter(lambda _: None)(data)
+    restored = MingTTSState.from_dict(payload.data)
+
+    assert restored.finish_reason == "stop"
+    assert restored.stop_step == 0
+    assert restored.completion_tokens == 1
+
+
+def test_ming_tts_result_adapter_preserves_sglang_length_finish_reason() -> None:
+    class FinishedReason:
+        def to_json(self):
+            return {"type": "length"}
+
+    data = request_data(
+        generated_latents=torch.ones(1, 2, 3),
+        req_finished_reason=FinishedReason(),
+    )
+
+    payload = make_result_adapter(lambda _: None)(data)
+    restored = MingTTSState.from_dict(payload.data)
+
+    assert restored.finish_reason == "length"
+    assert restored.stop_step is None
+
+
+def test_ming_tts_result_adapter_infers_length_at_max_steps() -> None:
+    data = request_data(
+        generated_latents=torch.stack(
+            (torch.ones(2, 3), torch.ones(2, 3) * 2),
+            dim=0,
+        ),
+    )
+
+    payload = make_result_adapter(lambda _: None)(data)
+    restored = MingTTSState.from_dict(payload.data)
+
+    assert restored.finish_reason == "length"
+    assert restored.completion_tokens == 2
+
+
+def test_ming_tts_stream_output_consumes_pending_patch_once() -> None:
+    data = request_data()
+    data.is_streaming = True
+    data.pending_stream_patch = MingTTSLatentPatch(
+        latent=torch.ones((2, 3), dtype=torch.float64),
+        is_last=True,
+    )
+
+    messages = build_ming_tts_stream_output("req-ming-tts", data, None)
+
+    assert len(messages) == 1
+    assert messages[0].request_id == "req-ming-tts"
+    assert messages[0].target == "audio_decode"
+    assert messages[0].metadata == {
+        "modality": "audio_latents",
+        "stream": True,
+        "is_last": True,
+    }
+    assert messages[0].data.device.type == "cpu"
+    assert messages[0].data.dtype == torch.float32
+    assert data.pending_stream_patch is None
+    assert build_ming_tts_stream_output("req-ming-tts", data, None) == []
+
+
+def test_ming_tts_result_adapter_resets_state_after_serialization_error(
+    monkeypatch,
+) -> None:
+    reset_requests = []
+
+    def fail_serialization(*args):
+        raise RuntimeError("serialization failed")
+
+    monkeypatch.setattr(engine_io, "store_ming_tts_state", fail_serialization)
+    data = request_data(generated_latents=torch.ones(1, 2, 3))
+
+    with pytest.raises(RuntimeError, match="serialization failed"):
+        make_result_adapter(reset_requests.append)(data)
+
+    assert reset_requests == ["req-ming-tts"]

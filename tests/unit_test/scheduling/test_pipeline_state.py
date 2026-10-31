@@ -1,0 +1,471 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import pytest
+import torch
+
+from sglang_omni.scheduling.pipeline_state import (
+    DeclarativeStateBase,
+    PipelineStateBase,
+    build_usage,
+    wire,
+)
+from sglang_omni.scheduling.typed_tensor import decode_typed_tensor, encode_typed_tensor
+
+
+@dataclass
+class DummyState(PipelineStateBase):
+    value: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, object] = {"value": self.value, "sample_rate": self.sample_rate}
+        self.append_usage_fields(data)
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DummyState":
+        return cls(
+            value=data.get("value", ""),
+            sample_rate=int(data.get("sample_rate", 24000)),
+            prompt_tokens=int(data.get("prompt_tokens", 0)),
+            completion_tokens=int(data.get("completion_tokens", 0)),
+            engine_time_s=float(data.get("engine_time_s", 0.0)),
+        )
+
+
+def test_build_usage_omits_empty_usage() -> None:
+    assert build_usage(DummyState()) is None
+
+
+def test_build_usage_includes_total_and_rounded_engine_time() -> None:
+    state = DummyState(prompt_tokens=3, completion_tokens=5, engine_time_s=1.23456789)
+
+    assert build_usage(state) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 5,
+        "total_tokens": 8,
+        "engine_time_s": 1.234568,
+    }
+
+
+def test_serialize_value_detaches_tensor_to_cpu() -> None:
+    tensor = torch.tensor([1, 2], requires_grad=False)
+
+    value = PipelineStateBase.serialize_value(tensor)
+
+    assert isinstance(value, torch.Tensor)
+    assert value.device.type == "cpu"
+    assert value.tolist() == [1, 2]
+
+    value = PipelineStateBase.serialize_value(
+        torch.tensor([1.0, 2.0], requires_grad=True)
+    )
+
+    assert not value.requires_grad
+    assert value.tolist() == [1.0, 2.0]
+
+
+def normalize_payload_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return {
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+            "data": value.detach().cpu().tolist(),
+        }
+    if isinstance(value, dict):
+        return {key: normalize_payload_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [normalize_payload_value(item) for item in value]
+    return value
+
+
+def assert_round_trip_preserves_payload(state: PipelineStateBase) -> None:
+    before = state.to_dict()
+    restored = type(state).from_dict(before)
+    after = restored.to_dict()
+
+    assert set(after) == set(before), type(state).__name__
+    assert normalize_payload_value(after) == normalize_payload_value(before)
+
+
+def assert_restored_fields(
+    state: PipelineStateBase, overrides: dict[str, Any] | None = None
+) -> None:
+    """Field-complete check on the *restored object's attributes*.
+
+    Every dataclass field of the restored state must equal the originally
+    constructed value; overrides lists only the fields whose representation
+    intentionally changes across the round trip (tensor/list conversions).
+    Iterating all fields instead of an explicit expected mapping makes it
+    impossible to silently omit a field: a to_dict() bug that drops a field
+    falls back to the dataclass default on restore, which a dict-vs-dict
+    comparison cannot see, and a hand-written expected mapping can forget
+    non-default fields like MOSS-Local's sample_rate=48000 (both raised in
+    PR #1019 review)."""
+    import dataclasses
+
+    overrides = overrides or {}
+    field_names = {field.name for field in dataclasses.fields(state)}
+    unknown = set(overrides) - field_names
+    assert not unknown, f"overrides for unknown fields: {unknown}"
+
+    restored = type(state).from_dict(state.to_dict())
+    for field in dataclasses.fields(state):
+        expected_value = overrides.get(field.name, getattr(state, field.name))
+        actual_value = getattr(restored, field.name)
+        assert normalize_payload_value(actual_value) == normalize_payload_value(
+            expected_value
+        ), (
+            f"{type(state).__name__}.{field.name}: "
+            f"{actual_value!r} != {expected_value!r}"
+        )
+
+
+def test_tts_pipeline_state_round_trips_preserve_payload_fields() -> None:
+    from sglang_omni.models.audar_tts.payload_types import AudarTTSState
+    from sglang_omni.models.dots_tts.payload_types import DotsTTSState
+    from sglang_omni.models.fishaudio_s2_pro.payload_types import S2ProState
+    from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
+    from sglang_omni.models.ming_tts.payload_types import MingTTSState
+    from sglang_omni.models.moss_tts.payload_types import MossTTSState
+    from sglang_omni.models.moss_tts_local.payload_types import MossTTSLocalState
+    from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+    from sglang_omni.models.voxtral_tts.io import VoxtralTTSState
+    from sglang_omni.models.zonos2.payload_types import Zonos2State
+
+    # Each (state, overrides) pair is checked two ways: the
+    # to_dict()-vs-to_dict() comparison (wire-format stability across a
+    # double round trip), and a field-complete attribute check on the
+    # restored object against the constructed values. overrides names only
+    # the intentional representation changes: Qwen3-TTS flattens tensors to
+    # lists in to_dict() and never rebuilds them in from_dict(); Voxtral does
+    # the same only for audio_samples (audio_codes round-trips as a tensor
+    # via typed_tensor bytes); MOSS / MOSS-Local / S2-Pro / Higgs round-trip
+    # their tensor fields natively. Note the float32 tensor -> Python list
+    # conversions derive expected values through the same precision path.
+    # note (Zhuofeng-Li): S2-Pro audio lists restore as float32 tensors after byte transport.
+    cases: list[tuple[PipelineStateBase, dict[str, Any]]] = [
+        (
+            AudarTTSState(
+                target_text="target",
+                reference_text="reference",
+                reference_audio={"bytes": b"wav"},
+                prompt="prompt",
+                audio_codes=[1, 2, 3],
+                generation_kwargs={"temperature": 0.7},
+                prompt_tokens=4,
+                completion_tokens=6,
+                engine_time_s=0.125,
+            ),
+            {},
+        ),
+        (
+            DotsTTSState(
+                prompt_audio_path="ref.wav",
+                use_prompt_prefill=True,
+                speaker_scale=1.5,
+                ode_method="euler",
+                num_steps=4,
+                guidance_scale=1.2,
+                seed=7,
+                stream=True,
+                sample_rate=48000,
+                prompt_tokens=3,
+                completion_tokens=5,
+                engine_time_s=0.25,
+            ),
+            {},
+        ),
+        (
+            S2ProState(
+                input_ids=[1, 2, 3],
+                vq_mask_tokens=[False, True, False],
+                vq_parts=[torch.tensor([[1, 2], [3, 4]])],
+                output_codes=torch.tensor([[0, 1], [2, 3]]),
+                prompt_tokens=3,
+                completion_tokens=5,
+                engine_time_s=0.125,
+                finish_reason="stop",
+                audio_samples=[0.1, 0.2],
+            ),
+            {"audio_samples": torch.tensor([0.1, 0.2], dtype=torch.float32)},
+        ),
+        (
+            HiggsTtsState(
+                prompt_token_ids=[10, 11],
+                reference_codes_delayed=[[1, 2], [3, 4]],
+                target_text="target",
+                reference_text="reference",
+                reference_waveform=torch.tensor([[[0.1, 0.2]]]),
+                reference_code_cache_key="cache-key",
+                uploaded_voice_name="voice",
+                uploaded_voice_created_at=123,
+                top_p=0.9,
+                top_k=10,
+                seed=7,
+                return_logprob=True,
+                return_omni_rollout=True,
+                output_codes_delayed=[[5, 6], [7, 8]],
+                omni_rollout={"tokens": [1, 2], "logprobs": [-0.1, -0.2]},
+                prompt_tokens=2,
+                completion_tokens=4,
+                engine_time_s=0.25,
+                audio_samples=torch.tensor([0.3, 0.4]),
+            ),
+            {},
+        ),
+        (
+            MingTTSState(
+                text="hello",
+                prompt="prompt",
+                instructions="calm",
+                language="en",
+                voice="voice",
+                ref_audio={"path": "ref.wav"},
+                ref_text="reference",
+                input_ids=[1, 2, 3, 4, 5, 6],
+                spk_injection_positions=[2],
+                prompt_latent_start_position=4,
+                prompt_latent_token_count=2,
+                spk_emb=torch.zeros(1, 2),
+                prompt_latent=torch.zeros(1, 1, 2),
+                max_decode_steps=16,
+                cfg=1.5,
+                sigma=0.2,
+                temperature=0.7,
+                generated_latents=torch.tensor(
+                    [[[0.5, -1.25]], [[2.0, 0.0]]],
+                    dtype=torch.float32,
+                ),
+                stop_step=1,
+                finish_reason="stop",
+                prompt_tokens=6,
+                completion_tokens=2,
+                engine_time_s=0.125,
+                sample_rate=44100,
+                duration_s=0.5,
+            ),
+            {},
+        ),
+        (
+            MossTTSState(
+                text="hello",
+                ref_audio={"path": "ref.wav"},
+                ref_text="ref",
+                language="en",
+                instructions="calm",
+                token_count=6,
+                generation_kwargs={"temperature": 0.7},
+                delayed_audio_codes=torch.tensor([[1, 2], [3, 4]]),
+                assistant_start_length=2,
+                prompt_tokens=6,
+                completion_tokens=8,
+                engine_time_s=0.375,
+            ),
+            {},
+        ),
+        (
+            MossTTSLocalState(
+                text="hello",
+                ref_audio={"path": "ref.wav"},
+                ref_text="ref",
+                language="en",
+                instructions="bright",
+                token_count=5,
+                generation_kwargs={"top_p": 0.8},
+                audio_codes=torch.tensor([[1, 2, 3], [4, 5, 6]]),
+                prompt_tokens=5,
+                completion_tokens=7,
+                engine_time_s=0.5,
+            ),
+            {},
+        ),
+        (
+            Qwen3TTSState(
+                text="hello",
+                task_type="Instruct",
+                task_type_explicit=True,
+                language="en",
+                voice="voice",
+                instructions="fast",
+                ref_audio={"path": "ref.wav"},
+                ref_text="ref",
+                speaker_embedding=[0.5, -0.25],
+                uploaded_voice_name="uploaded",
+                uploaded_voice_created_at=456,
+                x_vector_only_mode=True,
+                non_streaming_mode=True,
+                generation_kwargs={"seed": 9},
+                seed=9,
+                audio_codes=torch.tensor([[1, 2], [3, 4]]),
+                ref_code_len=1,
+                audio_samples=torch.tensor([0.5, 0.6]),
+                prompt_tokens=9,
+                completion_tokens=11,
+                engine_time_s=0.625,
+            ),
+            {
+                "audio_codes": [[1, 2], [3, 4]],
+                "audio_samples": torch.tensor([0.5, 0.6]).tolist(),
+            },
+        ),
+        (
+            VoxtralTTSState(
+                input_ids=[1, 2],
+                voice="voice",
+                max_new_tokens=16,
+                audio_codes=torch.tensor([[1, 2], [3, 4]]),
+                prompt_tokens=2,
+                completion_tokens=3,
+                engine_time_s=0.75,
+                audio_samples=torch.tensor([0.7, 0.8]),
+            ),
+            {
+                "audio_samples": torch.tensor([0.7, 0.8]).tolist(),
+            },
+        ),
+        (
+            Zonos2State(
+                text="hello",
+                ref_audio={"path": "ref.wav"},
+                ref_text="reference",
+                language="en",
+                speaking_rate=1.2,
+                conditioning={"emotion": "calm"},
+                input_ids=torch.zeros((3, 10), dtype=torch.long),
+                speaker_token_positions=[0],
+                speaker_emb=torch.tensor([0.1, 0.2, 0.3]),
+                speaker_fingerprint="wav:abc",
+                audio_codes=torch.tensor([[1, 2], [3, 4]]),
+                eos_frame=2,
+                generation_kwargs={"cfg_scale": 2.0},
+                prompt_tokens=3,
+                completion_tokens=2,
+                engine_time_s=0.125,
+            ),
+            {},
+        ),
+    ]
+
+    for state, overrides in cases:
+        assert_round_trip_preserves_payload(state)
+        assert_restored_fields(state, overrides)
+
+
+def test_typed_tensor_round_trip_preserves_values() -> None:
+    codes = torch.tensor([[1, 2, 3], [4, 5, 6]])
+
+    data = encode_typed_tensor(codes, key="audio_codes")
+
+    assert set(data) == {
+        "audio_codes_bytes",
+        "audio_codes_shape",
+        "audio_codes_dtype",
+    }
+    restored = decode_typed_tensor(data, key="audio_codes")
+    assert restored is not None
+    assert restored.dtype == torch.int64
+    assert restored.tolist() == [[1, 2, 3], [4, 5, 6]]
+
+
+def test_typed_tensor_picks_int32_for_large_values() -> None:
+    codes = torch.tensor([[70000, 1]])
+
+    data = encode_typed_tensor(codes, key="audio_codes")
+
+    assert data["audio_codes_dtype"] == "int32"
+    assert decode_typed_tensor(data, key="audio_codes").tolist() == [[70000, 1]]
+
+
+def test_typed_tensor_float_round_trip_transports_as_float32() -> None:
+    latents = torch.tensor([[0.5, -1.25], [2.0, 0.0]], dtype=torch.bfloat16)
+
+    data = encode_typed_tensor(latents, key="latents")
+
+    assert data["latents_dtype"] == "float32"
+    restored = decode_typed_tensor(data, key="latents")
+    assert restored.dtype == torch.float32
+    assert restored.tolist() == [[0.5, -1.25], [2.0, 0.0]]
+
+
+def test_typed_tensor_empty_float_round_trip_keeps_shape() -> None:
+    data = encode_typed_tensor(torch.empty((0, 2, 3)), key="latents")
+
+    assert data["latents_dtype"] == "float32"
+    restored = decode_typed_tensor(data, key="latents")
+    assert restored.shape == (0, 2, 3)
+    assert restored.dtype == torch.float32
+
+    data = encode_typed_tensor(torch.empty((0, 2), dtype=torch.int64), key="codes")
+
+    assert decode_typed_tensor(data, key="codes").shape == (0, 2)
+
+
+def test_typed_tensor_legacy_list_fallback_and_missing() -> None:
+    restored = decode_typed_tensor(
+        {"audio_codes": [[1, 2], [3, 4]]},
+        key="audio_codes",
+        legacy_key="audio_codes",
+    )
+    assert restored.tolist() == [[1, 2], [3, 4]]
+    assert decode_typed_tensor({}, key="audio_codes") is None
+
+
+def test_declarative_typed_tensor_missing_payload_keeps_default() -> None:
+    @dataclass
+    class TypedDefaultState(DeclarativeStateBase):
+        audio_codes: Any = wire(default_factory=lambda: [[9, 10]], codec="typed_tensor")
+
+    assert TypedDefaultState.from_dict({}).audio_codes == [[9, 10]]
+    assert TypedDefaultState.from_dict({"audio_codes": None}).audio_codes is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"audio_codes_bytes": b"\x01\x00"},
+        {"audio_codes_dtype": "uint16"},
+        {"audio_codes_bytes": None, "audio_codes_shape": [1]},
+        {
+            "audio_codes_bytes": b"\x01\x00",
+            "audio_codes_shape": [1],
+            "audio_codes_dtype": None,
+        },
+    ],
+)
+def test_declarative_typed_tensor_rejects_partial_payload(
+    payload: dict[str, Any],
+) -> None:
+    @dataclass
+    class TypedState(DeclarativeStateBase):
+        audio_codes: Any = wire(None, codec="typed_tensor")
+
+    with pytest.raises(ValueError, match="typed_tensor payload"):
+        TypedState.from_dict(payload)
+
+
+def test_declarative_typed_tensor_allows_omitted_dtype() -> None:
+    @dataclass
+    class TypedState(DeclarativeStateBase):
+        audio_codes: Any = wire(None, codec="typed_tensor")
+
+    payload = encode_typed_tensor(torch.tensor([1, 2]), key="audio_codes")
+    del payload["audio_codes_dtype"]
+
+    assert TypedState.from_dict(payload).audio_codes.tolist() == [1, 2]
+
+
+@pytest.mark.parametrize("emit", ["not-non"])
+def test_declarative_wire_rejects_unknown_emit_mode(emit: str) -> None:
+    with pytest.raises(ValueError, match="unknown wire emit mode"):
+        wire(None, emit=emit)
+
+
+def test_higgs_sample_rate_emission_stays_model_local() -> None:
+    from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
+
+    assert "sample_rate" not in HiggsTtsState().to_dict()
+    data = HiggsTtsState(sample_rate=16000, audio_samples=torch.tensor([0.1])).to_dict()
+    assert data["sample_rate"] == 16000

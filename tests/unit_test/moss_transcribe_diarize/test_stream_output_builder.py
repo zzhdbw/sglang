@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+from sglang_omni.models.moss_transcribe_diarize.request_builders import (
+    make_moss_transcribe_diarize_stream_output_builder,
+)
+from sglang_omni.proto import OmniRequest, StagePayload
+
+EOS = 999
+
+
+class ByteTokenizer:
+    """Token id → fixed bytes; UTF-8 decode with errors='replace'."""
+
+    eos_token_id = EOS
+
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        special_token_ids: set[int] | None = None,
+    ):
+        self.vocab = vocab
+        self.special = special_token_ids or set()
+
+    def decode(
+        self,
+        ids,
+        skip_special_tokens: bool = False,
+        clean_up_tokenization_spaces: bool = False,
+    ) -> str:
+        chunks = [
+            self.vocab[tid]
+            for tid in ids
+            if not (skip_special_tokens and tid in self.special)
+        ]
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def make_req_data(*, stream: bool = True, inflight_middle_chunks: int = 0) -> Any:
+    """Minimal req_data as OmniScheduler passes to stream_output_builder."""
+    stage_payload = StagePayload(
+        request_id="r",
+        request=OmniRequest(
+            inputs={"audio_bytes": b""},
+            params={"stream": stream},
+            metadata={},
+        ),
+        data={},
+    )
+    req = SimpleNamespace(inflight_middle_chunks=inflight_middle_chunks)
+    return SimpleNamespace(req=req, stage_payload=stage_payload)
+
+
+def make_req_output(token_id: int | None) -> SimpleNamespace:
+    return SimpleNamespace(data=token_id)
+
+
+def make_builder(vocab: dict[int, bytes], special: set[int] | None = None):
+    return make_moss_transcribe_diarize_stream_output_builder(
+        tokenizer=ByteTokenizer(vocab, special_token_ids=special),
+    )
+
+
+def test_emits_text_delta_when_streaming():
+    builder = make_builder({1: b"[0.00]"})
+    rd = make_req_data(stream=True)
+
+    msgs = builder("req-1", rd, make_req_output(1))
+
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert msg.type == "stream"
+    assert msg.request_id == "req-1"
+    assert msg.target is None
+    assert msg.data == {"text": "[0.00]", "modality": "text", "stage_name": "asr"}
+    assert msg.metadata == {"modality": "text", "token_id": 1}
+
+
+def test_silent_when_no_token_this_step():
+    builder = make_builder({1: b"A"})
+    rd = make_req_data(stream=True)
+
+    assert builder("req-1", rd, make_req_output(None)) == []
+
+
+def test_silent_when_req_or_payload_missing():
+    builder = make_builder({1: b"A"})
+
+    no_req = SimpleNamespace(req=None, stage_payload=None)
+    assert builder("req-1", no_req, make_req_output(1)) == []
+
+    no_payload = SimpleNamespace(
+        req=SimpleNamespace(inflight_middle_chunks=0), stage_payload=None
+    )
+    assert builder("req-1", no_payload, make_req_output(1)) == []
+
+
+def test_interior_replacement_char_does_not_stall_stream():
+    """Only a TRAILING U+FFFD is held; an interior one must flush normally."""
+    builder = make_builder({1: b"\x80", 2: b"ok"})
+    rd = make_req_data()
+
+    assert builder("req-1", rd, make_req_output(1)) == []
+    msgs = builder("req-1", rd, make_req_output(2))
+    assert [m.data["text"] for m in msgs] == ["\ufffdok"]
+
+
+def test_eos_token_emits_no_delta():
+    builder = make_builder({1: b"hi", EOS: b"<eos>"})
+    rd = make_req_data()
+
+    msgs = builder("req-1", rd, make_req_output(1))
+    assert [m.data["text"] for m in msgs] == ["hi"]
+    assert builder("req-1", rd, make_req_output(EOS)) == []
+
+
+def test_special_token_emits_no_delta():
+    """Tokens dropped by skip_special_tokens must not produce a chunk."""
+    builder = make_builder({1: b"hi", 2: b"<|im_end|>"}, special={2})
+    rd = make_req_data()
+
+    msgs = builder("req-1", rd, make_req_output(1))
+    assert [m.data["text"] for m in msgs] == ["hi"]
+    assert builder("req-1", rd, make_req_output(2)) == []
+
+
+def interval_builder(vocab: dict[int, bytes], interval_s: float):
+    return make_moss_transcribe_diarize_stream_output_builder(
+        tokenizer=ByteTokenizer(vocab),
+        min_emit_interval_s=interval_s,
+    )
+
+
+def test_min_emit_interval_elapsed_flushes_batch():
+    builder = interval_builder({1: b"A", 2: b"B", 3: b"C"}, interval_s=0.01)
+    rd = make_req_data()
+
+    assert [m.data["text"] for m in builder("r", rd, make_req_output(1))] == ["A"]
+    assert builder("r", rd, make_req_output(2)) == []
+
+    import time as _time
+
+    _time.sleep(0.02)
+    msgs = builder("r", rd, make_req_output(3))
+    assert [m.data["text"] for m in msgs] == ["BC"]
+
+
+def test_eos_with_empty_pending_emits_nothing():
+    builder = interval_builder({1: b"A"}, interval_s=3600.0)
+    rd = make_req_data()
+
+    assert [m.data["text"] for m in builder("r", rd, make_req_output(1))] == ["A"]
+    assert builder("r", rd, make_req_output(EOS)) == []
+
+
+def test_explicit_eos_token_id_overrides_tokenizer():
+    builder = make_moss_transcribe_diarize_stream_output_builder(
+        tokenizer=ByteTokenizer({1: b"A", 7: b"<stop>"}),
+        eos_token_id=7,
+    )
+    rd = make_req_data()
+
+    assert [m.data["text"] for m in builder("r", rd, make_req_output(1))] == ["A"]
+    assert builder("r", rd, make_req_output(7)) == []

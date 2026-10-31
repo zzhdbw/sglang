@@ -1,0 +1,432 @@
+# SPDX-License-Identifier: Apache-2.0
+"""TP=2 support tests."""
+
+from __future__ import annotations
+
+import importlib
+import sys
+from collections.abc import Iterable
+from types import ModuleType, SimpleNamespace
+
+import pytest
+
+PROJECT_PREFIX = "sglang_omni."
+
+
+def ming_config_with_thinker_tp2(config_cls):
+    config = config_cls(model_path="dummy")
+    stages = [stage.model_copy(deep=True) for stage in config.stages]
+    for stage in stages:
+        if stage.name == "thinker":
+            stage.tp_size = 2
+            stage.gpu = [0, 1]
+    return stages
+
+
+def module_refs_any(module: ModuleType, refs: Iterable[object]) -> bool:
+    ref_ids = {id(ref) for ref in refs}
+    return any(id(value) in ref_ids for value in vars(module).values())
+
+
+def purge_project_modules_with_fake_refs(
+    snapshot: set[str],
+    refs: Iterable[object],
+) -> set[str]:
+    purged: set[str] = set()
+    for name, module in list(sys.modules.items()):
+        if not name.startswith(PROJECT_PREFIX) or not isinstance(module, ModuleType):
+            continue
+        if name not in snapshot or module_refs_any(module, refs):
+            remove_module(name, module)
+            purged.add(name)
+    remove_cached_attrs_from_purged_modules(purged)
+    return purged
+
+
+def remove_module(name: str, module: ModuleType) -> None:
+    sys.modules.pop(name, None)
+    parent_name, _, child_name = name.rpartition(".")
+    parent = sys.modules.get(parent_name)
+    if isinstance(parent, ModuleType) and getattr(parent, child_name, None) is module:
+        delattr(parent, child_name)
+
+
+def remove_cached_attrs_from_purged_modules(purged: set[str]) -> None:
+    if not purged:
+        return
+    for module in list(sys.modules.values()):
+        if not isinstance(module, ModuleType) or not module.__name__.startswith(
+            PROJECT_PREFIX
+        ):
+            continue
+        for attr_name, value in list(vars(module).items()):
+            value_module = getattr(value, "__module__", "")
+            if module_name_matches_any(value_module, purged):
+                delattr(module, attr_name)
+
+
+def module_name_matches_any(module_name: str, candidates: set[str]) -> bool:
+    return any(
+        module_name == candidate or module_name.startswith(f"{candidate}.")
+        for candidate in candidates
+    )
+
+
+def project_modules_with_ref(ref: object) -> list[str]:
+    return [
+        name
+        for name, module in sys.modules.items()
+        if name.startswith(PROJECT_PREFIX)
+        and isinstance(module, ModuleType)
+        and module_refs_any(module, (ref,))
+    ]
+
+
+def cached_attrs_from_missing_project_modules() -> list[str]:
+    stale_attrs: list[str] = []
+    for module_name, module in sys.modules.items():
+        if not module_name.startswith(PROJECT_PREFIX) or not isinstance(
+            module, ModuleType
+        ):
+            continue
+        for attr_name, value in vars(module).items():
+            value_module = getattr(value, "__module__", "")
+            if not value_module.startswith(PROJECT_PREFIX):
+                continue
+            if value_module not in sys.modules:
+                stale_attrs.append(f"{module_name}.{attr_name}->{value_module}")
+    return stale_attrs
+
+
+def test_ming_speech_rejects_talker_inside_explicit_thinker_tp_gpus() -> None:
+    from sglang_omni.models.ming_omni.config import MingOmniSpeechPipelineConfig
+
+    stages = ming_config_with_thinker_tp2(MingOmniSpeechPipelineConfig)
+    for stage in stages:
+        if stage.name == "talker":
+            stage.gpu = 1
+
+    with pytest.raises(ValueError, match="collides"):
+        MingOmniSpeechPipelineConfig(model_path="dummy", stages=stages)
+
+
+@pytest.mark.parametrize(
+    ("config_cls_name", "stage_name", "gpu"),
+    [
+        ("MingOmniPipelineConfig", "audio_encoder", [0, 1]),
+        ("MingOmniSpeechPipelineConfig", "talker", [2, 3]),
+        ("MingOmniStreamingSpeechPipelineConfig", "talker_stream", [2, 3]),
+    ],
+)
+def test_ming_rejects_non_ar_stage_tp_size_gt_one(
+    config_cls_name: str,
+    stage_name: str,
+    gpu: list[int],
+) -> None:
+    import sglang_omni.models.ming_omni.config as ming_config
+
+    config_cls = getattr(ming_config, config_cls_name)
+    config = config_cls(model_path="dummy")
+    stages = [stage.model_copy(deep=True) for stage in config.stages]
+    for stage in stages:
+        if stage.name == stage_name:
+            stage.tp_size = 2
+            stage.gpu = gpu
+
+    with pytest.raises(ValueError, match=f"{stage_name}.*does not support TP"):
+        config_cls(model_path="dummy", stages=stages)
+
+
+def test_ming_streaming_speech_allows_thinker_tp_size_gt_one() -> None:
+    from sglang_omni.models.ming_omni.config import (
+        MingOmniStreamingSpeechPipelineConfig,
+    )
+
+    stages = ming_config_with_thinker_tp2(MingOmniStreamingSpeechPipelineConfig)
+    for stage in stages:
+        if stage.name == "talker_stream":
+            stage.gpu = 2
+
+    config = MingOmniStreamingSpeechPipelineConfig(model_path="dummy", stages=stages)
+
+    assert config.gpu_placement["thinker"] == [0, 1]
+    assert config.gpu_placement["talker_stream"] == 2
+
+
+def test_ming_text_allows_image_encoder_tp_size_gt_one() -> None:
+    from sglang_omni.models.ming_omni.config import MingOmniPipelineConfig
+
+    config = MingOmniPipelineConfig(model_path="dummy")
+    stages = [stage.model_copy(deep=True) for stage in config.stages]
+    for stage in stages:
+        if stage.name == "image_encoder":
+            stage.tp_size = 2
+            stage.gpu = [2, 3]
+
+    rebuilt = MingOmniPipelineConfig(model_path="dummy", stages=stages)
+
+    assert rebuilt.gpu_placement["image_encoder"] == [2, 3]
+
+
+def test_ming_speech_rejects_any_talker_gpu_list_overlap_with_thinker_tp() -> None:
+    from sglang_omni.models.ming_omni.config import MingOmniSpeechPipelineConfig
+
+    stages = ming_config_with_thinker_tp2(MingOmniSpeechPipelineConfig)
+    for stage in stages:
+        if stage.name == "thinker":
+            stage.gpu = [0, 2]
+        if stage.name == "talker":
+            stage.gpu = [2]
+
+    with pytest.raises(ValueError, match="collides"):
+        MingOmniSpeechPipelineConfig(model_path="dummy", stages=stages)
+
+
+def test_ming_speech_allows_talker_outside_explicit_thinker_tp_gpus() -> None:
+    from sglang_omni.models.ming_omni.config import MingOmniSpeechPipelineConfig
+
+    stages = ming_config_with_thinker_tp2(MingOmniSpeechPipelineConfig)
+    for stage in stages:
+        if stage.name == "talker":
+            stage.gpu = 2
+
+    config = MingOmniSpeechPipelineConfig(model_path="dummy", stages=stages)
+
+    assert config.gpu_placement["thinker"] == [0, 1]
+    assert config.gpu_placement["talker"] == 2
+
+
+def test_ming_bootstrap_aligns_server_args_tp_size_before_infra(
+    monkeypatch,
+) -> None:
+    from sglang.srt.arg_groups.overrides import resolution_result
+    from sglang.srt.server_args import ServerArgs
+
+    captured: dict[str, object] = {}
+
+    common_module = ModuleType("sglang_omni.models.ming_omni.components.common")
+    common_module.load_ming_tokenizer = lambda _model_path: SimpleNamespace(
+        vocab_size=32000,
+        eos_token_id=2,
+        unk_token_id=0,
+        convert_tokens_to_ids=lambda token: 0,
+    )
+    common_module.load_ming_config = lambda _model_path: SimpleNamespace(
+        llm_config=SimpleNamespace(vocab_size=32000)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang_omni.models.ming_omni.components.common",
+        common_module,
+    )
+
+    runner_module = ModuleType("sglang_omni.model_runner.ming_thinker_model_runner")
+
+    class FakeMingThinkerModelRunner:
+        def __init__(self, model_worker, output_proc):
+            self.model_worker = model_worker
+            self.output_proc = output_proc
+
+    runner_module.MingThinkerModelRunner = FakeMingThinkerModelRunner
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang_omni.model_runner.ming_thinker_model_runner",
+        runner_module,
+    )
+
+    scheduling_bootstrap_module = ModuleType("sglang_omni.scheduling.bootstrap")
+
+    def fake_create_sglang_infrastructure(
+        server_args,
+        gpu_id,
+        *,
+        tp_rank,
+        nccl_port,
+        model_arch_override,
+    ):
+        captured["server_args_tp_size"] = resolution_result(server_args, "tp_size")
+        captured["gpu_id"] = gpu_id
+        captured["tp_rank"] = tp_rank
+        captured["nccl_port"] = nccl_port
+        captured["model_arch_override"] = model_arch_override
+        model = object()
+        model_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(model=model),
+        )
+        return (
+            model_worker,
+            "tree_cache",
+            "req_to_token_pool",
+            "token_to_kv_pool_allocator",
+            "model_config",
+        )
+
+    scheduling_bootstrap_module.create_sglang_infrastructure = (
+        fake_create_sglang_infrastructure
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang_omni.scheduling.bootstrap",
+        scheduling_bootstrap_module,
+    )
+
+    omni_scheduler_module = ModuleType("sglang_omni.scheduling.omni_scheduler")
+
+    class FakeOmniScheduler:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    omni_scheduler_module.OmniScheduler = FakeOmniScheduler
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang_omni.scheduling.omni_scheduler",
+        omni_scheduler_module,
+    )
+
+    sglang_backend_module = ModuleType("sglang_omni.scheduling.sglang_backend")
+
+    class FakeSGLangOutputProcessor:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    sglang_backend_module.SGLangOutputProcessor = FakeSGLangOutputProcessor
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang_omni.scheduling.sglang_backend",
+        sglang_backend_module,
+    )
+
+    bootstrap = importlib.import_module("sglang_omni.models.ming_omni.bootstrap")
+    server_args = ServerArgs(model_path="dummy")
+    server_args.resolve_once()
+
+    scheduler = bootstrap.create_thinker_scheduler(
+        server_args,
+        model_path="dummy",
+        gpu_id=1,
+        tp_rank=1,
+        tp_size=2,
+        nccl_port=29500,
+    )
+
+    assert captured["server_args_tp_size"] == 2
+    assert resolution_result(server_args, "tp_size") == 2
+    assert captured["gpu_id"] == 1
+    assert captured["tp_rank"] == 1
+    assert captured["nccl_port"] == 29500
+    assert captured["model_arch_override"] == "BailingMoeV2ForCausalLM"
+    assert scheduler.kwargs["server_args"] is server_args
+
+
+@pytest.mark.asyncio
+async def test_tp_leader_skips_fanout_work_for_omni_scheduler() -> None:
+    """OmniScheduler-backed leaders must not call fanout_work()."""
+    import queue as _queue_mod
+    from unittest.mock import MagicMock
+
+    importlib.import_module("sglang_omni.pipeline")
+    before_import = set(sys.modules)
+    fake_torch = ModuleType("torch")
+    fake_torch.Tensor = object
+    for dtype_name in (
+        "bool",
+        "uint8",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "float16",
+        "bfloat16",
+        "float32",
+        "float64",
+        "complex64",
+        "complex128",
+    ):
+        setattr(fake_torch, dtype_name, object())
+    fake_profiler = ModuleType("torch.profiler")
+    fake_profiler.ProfilerActivity = SimpleNamespace(CPU="cpu", CUDA="cuda")
+    fake_profiler.supported_activities = lambda: {"cpu"}
+
+    class FakeProfile:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    fake_profiler.profile = FakeProfile
+    fake_torch.profiler = fake_profiler
+    fake_nixl = ModuleType("sglang_omni.relay.nixl")
+
+    class FakeConnection:
+        pass
+
+    class FakeNixlOperation:
+        pass
+
+    class FakeNixlRelay:
+        pass
+
+    fake_nixl.NIXL_AVAILABLE = False
+    fake_nixl.Connection = FakeConnection
+    fake_nixl.NixlOperation = FakeNixlOperation
+    fake_nixl.NixlRelay = FakeNixlRelay
+    fake_refs = (
+        fake_torch,
+        fake_profiler,
+        fake_nixl,
+        FakeConnection,
+        FakeNixlOperation,
+        FakeNixlRelay,
+    )
+
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setitem(sys.modules, "torch", fake_torch)
+            mp.setitem(sys.modules, "torch.profiler", fake_profiler)
+            mp.setitem(sys.modules, "sglang_omni.relay.nixl", fake_nixl)
+
+            from sglang_omni.pipeline.stage.runtime import Stage
+            from sglang_omni.pipeline.tp_control import TPLeaderFanout
+
+            fanout = MagicMock(spec=TPLeaderFanout)
+
+            omni_like = SimpleNamespace(
+                inbox=_queue_mod.Queue(),
+                requires_tp_work_fanout=False,
+            )
+            simple_like = SimpleNamespace(
+                inbox=_queue_mod.Queue(),
+                requires_tp_work_fanout=True,
+            )
+
+            def make_stage(scheduler):
+                return Stage(
+                    name="test_stage",
+                    role="leader",
+                    get_next=lambda _name: [],
+                    gpu_id=0,
+                    endpoints={},
+                    control_plane=MagicMock(),
+                    relay=MagicMock(),
+                    scheduler=scheduler,
+                    tp_fanout=fanout,
+                )
+
+            payload = SimpleNamespace(
+                request_id="req-1", request=SimpleNamespace(metadata={})
+            )
+
+            stage_omni = make_stage(omni_like)
+            await stage_omni.execute(payload)
+            fanout.fanout_work.assert_not_called()
+            assert omni_like.inbox.get_nowait().request_id == "req-1"
+
+            fanout.reset_mock()
+
+            stage_simple = make_stage(simple_like)
+            await stage_simple.execute(payload)
+            fanout.fanout_work.assert_called_once_with(payload)
+            assert simple_like.inbox.get_nowait().request_id == "req-1"
+    finally:
+        purge_project_modules_with_fake_refs(before_import, fake_refs)
+
+    assert project_modules_with_ref(fake_torch) == []
+    assert cached_attrs_from_missing_project_modules() == []

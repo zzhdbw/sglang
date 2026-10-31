@@ -1,0 +1,543 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Speed benchmarks and voice-clone WER CI for Qwen3-Omni.
+
+Usage:
+    pytest tests/test_model/test_qwen3_omni_tts_ci.py -s -x
+
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+import requests
+
+from benchmarks.dataset.prepare import DATASETS, download_dataset
+from benchmarks.eval.benchmark_omni_seedtts import (
+    OmniSeedttsBenchmarkConfig,
+    run_omni_seedtts_benchmark,
+)
+from benchmarks.metrics._format import format_benchmark_dataset_label
+from benchmarks.metrics.performance import print_speed_summary
+from benchmarks.metrics.wer import print_wer_summary
+from tests.test_model.omni_ci_config import OmniCiModelPreset
+from tests.test_model.omni_router_utils import (
+    ManagedRouterHandle,
+    assert_router_healthy,
+    assert_workers_served_requests_since,
+    print_log_tail,
+    print_router_diagnostics,
+    router_get_json,
+)
+from tests.utils import (
+    QWEN3_ASR_WER_CONCURRENCY,
+    MetricCheckCollector,
+    assert_per_request_fields,
+    assert_speed_thresholds,
+    assert_summary_metrics,
+    assert_wer_partitioned,
+    no_proxy_env,
+    wait_for_gpu_memory_release,
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+CONCURRENCY = 16
+MAX_SAMPLES = 50
+# Optional user override: a path to a custom fine-tuned WavLM checkpoint.
+# When unset, the bootstrapper in benchmarks.metrics.speaker_similarity_assets
+# auto-downloads the official weights into the shared cache directory.
+SIMILARITY_CHECKPOINT_ENV = "SEEDTTS_SIM_CHECKPOINT"
+
+WER_TIMEOUT = 600
+SIMILARITY_TIMEOUT = 600
+UTMOS_TIMEOUT = 600
+
+
+def thinker_prefill_graph_info(worker_port: int) -> dict:
+    with requests.Session() as session:
+        session.trust_env = False
+        response = session.post(
+            f"http://127.0.0.1:{worker_port}/model_info",
+            json={"stages": ["thinker"], "timeout_s": 30},
+            timeout=60,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    thinker_items = [
+        item for item in payload["stages"] if item.get("stage") == "thinker"
+    ]
+    assert len(thinker_items) == 1, payload
+    thinker = thinker_items[0]
+    assert thinker["success"], thinker
+    return thinker["data"]["prefill_cuda_graph"]
+
+
+SEEDTTS_50_DATASET_LABEL = format_benchmark_dataset_label(
+    dataset="seedtts-50",
+    repo_id=DATASETS["seedtts-50"],
+)
+
+
+def run_benchmark(
+    omni_ci_model: OmniCiModelPreset,
+    port: int,
+    meta: str,
+    output_dir: str,
+) -> dict:
+    config = OmniSeedttsBenchmarkConfig(
+        model=omni_ci_model.name,
+        port=port,
+        meta=meta,
+        output_dir=output_dir,
+        max_samples=MAX_SAMPLES,
+        max_concurrency=CONCURRENCY,
+        voice_clone=True,
+        reference_audio_field=omni_ci_model.reference_audio_field,
+    )
+    speed_results = asyncio.run(run_omni_seedtts_benchmark(config))
+    assert (
+        "summary" in speed_results
+    ), f"Missing 'summary' key in results. Keys: {list(speed_results.keys())}"
+    assert (
+        "per_request" in speed_results
+    ), f"Missing 'per_request' key in results. Keys: {list(speed_results.keys())}"
+    return speed_results
+
+
+def run_wer_transcribe(
+    omni_ci_model: OmniCiModelPreset,
+    meta: str,
+    output_dir: str,
+    *,
+    asr_router_port: int,
+    lang: str = "en",
+    device: str = "cuda:0",
+) -> dict:
+    """Transcribe saved audio and compute WER via Qwen3-ASR router."""
+    from benchmarks.eval.benchmark_omni_seedtts import (
+        OmniSeedttsBenchmarkConfig,
+        evaluate_generated_audio,
+    )
+
+    config = OmniSeedttsBenchmarkConfig(
+        model=omni_ci_model.name,
+        meta=meta,
+        output_dir=output_dir,
+        lang=lang,
+        device=device,
+        port=asr_router_port,
+        asr_concurrency=QWEN3_ASR_WER_CONCURRENCY,
+    )
+    evaluate_generated_audio(config)
+
+    results_path = Path(output_dir) / "wer_results.json"
+    assert results_path.exists(), f"WER results file not found: {results_path}"
+
+    with open(results_path) as f:
+        wer_results = json.load(f)
+    assert (
+        "summary" in wer_results
+    ), f"Missing 'summary' key in WER results. Keys: {list(wer_results.keys())}"
+    assert (
+        "per_sample" in wer_results
+    ), f"Missing 'per_sample' key in WER results. Keys: {list(wer_results.keys())}"
+
+    summary = wer_results["summary"]
+    if summary.get("skipped", 0) > 0:
+        print(
+            f"\n[WER DIAGNOSTIC] {summary['skipped']}/{summary['total_samples']} "
+            "samples skipped."
+        )
+        for sample in wer_results["per_sample"]:
+            if not sample.get("is_success", True):
+                print(f"  FAILED sample {sample['id']}: {sample.get('error')}")
+
+    return wer_results
+
+
+def run_similarity(
+    omni_ci_model: OmniCiModelPreset,
+    meta: str,
+    output_dir: str,
+    checkpoint_path: str | None,
+    *,
+    device: str = "cuda:0",
+) -> dict:
+    """Compute SeedTTS speaker similarity in CI (mirrors WER subprocess pattern)."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "benchmarks.eval.benchmark_omni_seedtts",
+        "--similarity-only",
+        "--meta",
+        meta,
+        "--output-dir",
+        output_dir,
+        "--model",
+        omni_ci_model.name,
+        "--device",
+        device,
+    ]
+    if checkpoint_path is not None:
+        cmd += ["--similarity-checkpoint", checkpoint_path]
+
+    env = no_proxy_env()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{PROJECT_ROOT}{os.pathsep}{existing}" if existing else str(PROJECT_ROOT)
+    )
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=SIMILARITY_TIMEOUT,
+        env=env,
+        cwd=str(PROJECT_ROOT),
+    )
+    assert result.returncode == 0, (
+        f"Similarity eval failed (rc={result.returncode}).\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+    results_path = Path(output_dir) / "similarity_results.json"
+    assert results_path.exists(), f"Similarity results file not found: {results_path}"
+
+    with open(results_path) as f:
+        similarity_results = json.load(f)
+    assert "summary" in similarity_results, (
+        "Missing 'summary' key in similarity results. "
+        f"Keys: {list(similarity_results.keys())}"
+    )
+    assert "per_sample" in similarity_results, (
+        "Missing 'per_sample' key in similarity results. "
+        f"Keys: {list(similarity_results.keys())}"
+    )
+    return similarity_results
+
+
+def assert_similarity_results(
+    results: dict,
+    min_mean: float,
+    *,
+    collector: MetricCheckCollector | None = None,
+) -> None:
+    checks = collector or MetricCheckCollector("speaker similarity")
+    summary = results["summary"]
+    per_sample = results["per_sample"]
+    mean = summary.get("speaker_similarity_mean")
+    checks.check(bool(per_sample), "Expected per-sample speaker similarity results")
+    if mean is None:
+        checks.fail("Missing speaker_similarity_mean in summary")
+    else:
+        checks.check(
+            mean >= min_mean,
+            f"speaker_similarity_mean {mean:.4f} < threshold {min_mean:.4f}",
+        )
+    if collector is None:
+        checks.assert_all()
+
+
+def run_utmos(
+    omni_ci_model: OmniCiModelPreset, output_dir: str, *, device: str = "cuda:0"
+) -> dict:
+    cmd = [
+        sys.executable,
+        "-m",
+        "benchmarks.eval.benchmark_omni_seedtts",
+        "--utmos-only",
+        "--meta",
+        DATASETS["seedtts-50"],
+        "--output-dir",
+        output_dir,
+        "--model",
+        omni_ci_model.name,
+        "--device",
+        device,
+    ]
+    env = no_proxy_env()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{PROJECT_ROOT}{os.pathsep}{existing}" if existing else str(PROJECT_ROOT)
+    )
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=UTMOS_TIMEOUT,
+        env=env,
+        cwd=str(PROJECT_ROOT),
+    )
+    assert result.returncode == 0, (
+        f"UTMOS eval failed (rc={result.returncode}).\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    results_path = Path(output_dir) / "utmos_results.json"
+    assert results_path.exists(), f"UTMOS results file not found: {results_path}"
+    with open(results_path) as f:
+        return json.load(f)
+
+
+def assert_utmos_results(
+    results: dict,
+    threshold: float,
+    *,
+    collector: MetricCheckCollector | None = None,
+) -> None:
+    checks = collector or MetricCheckCollector("UTMOS")
+    summary = results.get("summary", {})
+    checks.check(bool(results.get("per_sample")), "per_sample must be non-empty")
+    checks.check(
+        summary.get("skipped", 0) == 0,
+        f"UTMOS: {summary.get('skipped')} skipped samples != 0",
+    )
+    mean = summary.get("utmos_mean")
+    if mean is None:
+        checks.fail("Missing utmos_mean in summary")
+    else:
+        checks.check(
+            mean >= threshold,
+            f"utmos_mean {mean:.4f} < threshold {threshold:.4f}",
+        )
+    if collector is None:
+        checks.assert_all()
+
+
+@pytest.fixture(scope="module")
+def dataset_repo() -> str:
+    repo_id = DATASETS["seedtts-50"]
+    download_dataset(repo_id, quiet=True)
+    return repo_id
+
+
+@pytest.fixture(scope="module")
+def similarity_checkpoint() -> str | None:
+    """User-specified WavLM checkpoint override, or None to let the bootstrapper
+    auto-resolve the default weights from the shared cache directory."""
+    raw = os.environ.get(SIMILARITY_CHECKPOINT_ENV)
+    if not raw:
+        return None
+    return str(Path(raw).expanduser())
+
+
+@dataclass
+class SpeedArtifacts:
+    """Outputs from the voice-clone speed benchmark.
+
+    Speed-threshold assertions are deliberately NOT made here so that a
+    speed miss does not cascade-skip the WER fixture chain. The speed
+    test asserts; the WER test reuses only ``output_dir``.
+    """
+
+    output_dir: str
+    summary: dict
+    per_request: list
+    router_before: dict
+
+
+@pytest.fixture(scope="module")
+def speed_artifacts(
+    omni_ci_model: OmniCiModelPreset,
+    omni_ci_server: ManagedRouterHandle,
+    dataset_repo: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> SpeedArtifacts:
+    """Run the speed benchmark once and expose its artifacts."""
+    output_dir = str(tmp_path_factory.mktemp("vc_nonstream"))
+    try:
+        assert_router_healthy(omni_ci_server)
+        router_before = router_get_json(
+            omni_ci_server.port,
+            "/diagnostics",
+        )
+
+        models = router_get_json(omni_ci_server.port, "/v1/models")
+        assert {card["id"] for card in models["data"]} == {omni_ci_model.name}
+
+        results = run_benchmark(
+            omni_ci_model,
+            omni_ci_server.port,
+            dataset_repo,
+            output_dir,
+        )
+    except Exception:
+        print_router_diagnostics(omni_ci_server)
+        raise
+    return SpeedArtifacts(
+        output_dir=output_dir,
+        summary=results["summary"],
+        per_request=results["per_request"],
+        router_before=router_before,
+    )
+
+
+@pytest.fixture(scope="module")
+def wer_audio_dir(
+    omni_ci_server: ManagedRouterHandle,
+    speed_artifacts: SpeedArtifacts,
+) -> str:
+    """Reuse speed-benchmark audio for WER after freeing the TTS server GPU."""
+    omni_ci_server.stop()
+    wait_for_gpu_memory_release()
+    generated_path = Path(speed_artifacts.output_dir) / "generated.json"
+    assert generated_path.exists(), f"WER metadata missing: {generated_path}"
+    return speed_artifacts.output_dir
+
+
+@pytest.mark.benchmark
+def test_voice_cloning_non_streaming(
+    omni_ci_model: OmniCiModelPreset,
+    omni_ci_server: ManagedRouterHandle,
+    speed_artifacts: SpeedArtifacts,
+) -> None:
+    """Print speed summary and assert metrics meet thresholds."""
+    try:
+        print_speed_summary(
+            speed_artifacts.summary,
+            omni_ci_model.name,
+            CONCURRENCY,
+            title="TTS Voice-Clone Speed",
+            dataset=SEEDTTS_50_DATASET_LABEL,
+        )
+        thresholds = omni_ci_model.thresholds["tts"]
+        checks = MetricCheckCollector(f"{omni_ci_model.name} voice-cloning speed")
+        assert_summary_metrics(speed_artifacts.summary, collector=checks)
+        assert_per_request_fields(speed_artifacts.per_request, collector=checks)
+        if thresholds.calibrated:
+            assert_speed_thresholds(
+                speed_artifacts.summary,
+                thresholds.speed,
+                CONCURRENCY,
+                collector=checks,
+            )
+        checks.check(
+            Path(speed_artifacts.output_dir).is_dir(),
+            f"Speed output directory missing: {speed_artifacts.output_dir}",
+        )
+
+        checks.check_assertion(
+            "router worker traffic",
+            assert_workers_served_requests_since,
+            handle=omni_ci_server,
+            before_snapshot=speed_artifacts.router_before,
+            label=f"{omni_ci_model.name} voice cloning",
+            min_total_requests=MAX_SAMPLES,
+        )
+        thresholds.require_calibrated(omni_ci_model.name, "tts", checks)
+        checks.assert_all()
+    except Exception:
+        print_router_diagnostics(omni_ci_server)
+        raise
+
+
+@pytest.mark.benchmark
+@pytest.mark.usefixtures("speed_artifacts")
+def test_speech_prefill_graph_replays_in_existing_tts_stage(
+    omni_ci_model: OmniCiModelPreset,
+    omni_ci_server: ManagedRouterHandle,
+) -> None:
+    if omni_ci_model.name != "qwen3-omni":
+        pytest.skip("Speech prefill CUDA graph replay is Qwen3-Omni-specific")
+    for worker_port in omni_ci_server.worker_ports:
+        info = thinker_prefill_graph_info(worker_port)
+        assert info["backend"] == "breakable"
+        assert info["runner"] == "PrefillCudaGraphRunner"
+        assert info["backend_runner"] == "BreakableCudaGraphBackend"
+        assert info["input_embeds_slot"] is True
+        assert info["replay_count"] > 0
+
+
+@pytest.mark.benchmark
+def test_voice_cloning_wer(
+    omni_ci_model: OmniCiModelPreset,
+    wer_audio_dir: str,
+    dataset_repo: str,
+    qwen3_asr_wer_router: ManagedRouterHandle,
+) -> None:
+    results = run_wer_transcribe(
+        omni_ci_model,
+        dataset_repo,
+        wer_audio_dir,
+        asr_router_port=qwen3_asr_wer_router.port,
+    )
+    print_wer_summary(
+        results["summary"], omni_ci_model.name, dataset=SEEDTTS_50_DATASET_LABEL
+    )
+    thresholds = omni_ci_model.thresholds["tts"]
+    checks = MetricCheckCollector(f"{omni_ci_model.name} voice-cloning WER")
+    assert_wer_partitioned(
+        results,
+        max_wer_below_50_corpus=(
+            thresholds.wer if thresholds.calibrated else float("inf")
+        ),
+        max_n_above_50=(
+            thresholds.n_above_50 if thresholds.calibrated else float("inf")
+        ),
+        collector=checks,
+    )
+    thresholds.require_calibrated(omni_ci_model.name, "tts", checks)
+    checks.assert_all()
+    print_log_tail("asr_wer_router", qwen3_asr_wer_router.log_file)
+
+
+@pytest.mark.benchmark
+def test_voice_cloning_similarity(
+    omni_ci_model: OmniCiModelPreset,
+    wer_audio_dir: str,
+    dataset_repo: str,
+    similarity_checkpoint: str | None,
+) -> None:
+    """Score saved audio; Qwen3-Omni's similarity gate remains disabled by #483."""
+    results = run_similarity(
+        omni_ci_model,
+        dataset_repo,
+        wer_audio_dir,
+        similarity_checkpoint,
+    )
+    summary = results.get("summary", {})
+    thresholds = omni_ci_model.thresholds["tts"]
+    checks = MetricCheckCollector(f"{omni_ci_model.name} speaker similarity structure")
+    checks.check(
+        summary.get("speaker_similarity_mean") is not None,
+        "Missing speaker_similarity_mean in summary",
+    )
+    checks.check(
+        bool(results.get("per_sample")),
+        "Expected per-sample speaker similarity results",
+    )
+    checks.check(
+        summary.get("skipped", 0) == 0,
+        f"speaker similarity: {summary.get('skipped')} skipped samples != 0",
+    )
+    if omni_ci_model.name == "minicpmo" and thresholds.calibrated:
+        assert_similarity_results(results, thresholds.similarity, collector=checks)
+    thresholds.require_calibrated(omni_ci_model.name, "tts", checks)
+    checks.assert_all()
+
+
+@pytest.mark.benchmark
+def test_voice_cloning_utmos(
+    omni_ci_model: OmniCiModelPreset, wer_audio_dir: str
+) -> None:
+    results = run_utmos(omni_ci_model, wer_audio_dir)
+    thresholds = omni_ci_model.thresholds["tts"]
+    checks = MetricCheckCollector(f"{omni_ci_model.name} voice-cloning UTMOS")
+    assert_utmos_results(
+        results,
+        thresholds.utmos if thresholds.calibrated else float("-inf"),
+        collector=checks,
+    )
+    thresholds.require_calibrated(omni_ci_model.name, "tts", checks)
+    checks.assert_all()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-s", "-x", "-v"]))
