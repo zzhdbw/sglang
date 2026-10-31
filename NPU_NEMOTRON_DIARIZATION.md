@@ -195,6 +195,30 @@ end-to-end time.  See
 [`benchmarks/npu/PROFILE_NEMOTRON_DIARIZATION_NPU.md`](./benchmarks/npu/PROFILE_NEMOTRON_DIARIZATION_NPU.md)
 for the full profile.
 
+### Throughput after OMP tuning
+
+Measured on the tuned instance with `OMP_NUM_THREADS=16` and
+`MKL_NUM_THREADS=16`:
+
+| Workload | Default OMP=1 | Tuned OMP=16 | Improvement |
+| --- | ---: | ---: | ---: |
+| 11.0 s upload, warm mean | 66.85 ms | 62.81 ms | 1.06× |
+| 51.6 min upload, mean | 19.93 s | **14.84 s** | **1.34×** |
+| 51.6 min upload, realtime factor | 155.4× | **208.7×** | +34% |
+
+Live 250 ms / 250 ms concurrency for 60 s:
+
+| Setting | Stable streams per 310P3 | First failing point |
+| --- | ---: | ---: |
+| Default OMP=1 | 10 | 11+ |
+| Tuned OMP=16 | **12** | 13+ |
+
+For 1000 ms / 1000 ms live chunks on the tuned instance, 12 streams completed
+60 s without errors (wall 61.36 s, p95 ACK lag 1.36 s).  14 streams completed
+but could not keep up (wall 63.96 s, p95 lag 3.35 s).  The practical live
+ceiling is therefore about 12 streams per die; 10 streams is the recommended
+operating point with latency headroom.
+
 ## Live concurrency: 250 ms uploaded every 250 ms
 
 This is the more relevant capacity metric for realtime audio.  Each WebSocket
