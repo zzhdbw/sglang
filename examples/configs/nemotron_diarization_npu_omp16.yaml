@@ -1,0 +1,5 @@
+config_cls: NemotronDiarizationPipelineConfig
+model_path: /workspace/models/Nemotron-3-Diarization/Nemotron-3-Diarization.nemo
+env_defaults:
+  OMP_NUM_THREADS: "16"
+  MKL_NUM_THREADS: "16"

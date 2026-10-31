@@ -177,6 +177,24 @@ Benchmark caveat: the repeated-speaker JFK sample measures compute throughput,
 not diarization quality.  DER/accuracy should be evaluated on representative
 multi-speaker recordings.
 
+## Profiling and OMP tuning
+
+The full-file CPU STFT/mel preprocessor is single-threaded by default because
+the worker inherits `OMP_NUM_THREADS=1`.  On one 310P, a 51.6-minute meeting
+request dropped from **19.93 s** to **14.48 s** after launching the service
+with:
+
+```bash
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+```
+
+CPU preprocessing dropped from 8.71 s to 1.69 s.  NPU compute then becomes the
+dominant cost.  Communication/coordinator overhead was only about 5.5% of the
+end-to-end time.  See
+[`benchmarks/npu/PROFILE_NEMOTRON_DIARIZATION_NPU.md`](./benchmarks/npu/PROFILE_NEMOTRON_DIARIZATION_NPU.md)
+for the full profile.
+
 ## Live concurrency: 250 ms uploaded every 250 ms
 
 This is the more relevant capacity metric for realtime audio.  Each WebSocket
