@@ -219,6 +219,61 @@ Run the benchmark with:
   --streams 8 --seconds 60
 ```
 
+## Best upload chunk size and interval
+
+The WebSocket endpoint accepts at most `32000` bytes per audio message, i.e.
+1000 ms of 16 kHz PCM16.
+
+### Single-stream pipeline throughput
+
+Closed-loop means: send one chunk, wait for `audio.ack`, then immediately send
+the next chunk.  This removes the offered-rate limit and measures the pipeline:
+
+| Chunk size | 60 s audio wall time | Throughput |
+| ---: | ---: | ---: |
+| 250 ms | 5.99–6.24 s | 9.6–10.0× real time |
+| 500 ms | 5.54–5.84 s | 10.3–10.8× real time |
+| 1000 ms | 5.25–5.58 s | 10.8–11.4× real time |
+
+**1000 ms chunks are the best choice for raw throughput.**  They reduce the
+number of scheduler/WebSocket round trips by 4× versus 250 ms chunks.
+
+### Fixed send interval
+
+At an offered load of about 10× real time:
+
+| Chunk / interval | Offered load | ACK lag max | Result |
+| ---: | ---: | ---: | --- |
+| 1000 ms / 100 ms | 10× | 0.24 s | stable |
+| 500 ms / 50 ms | 10× | 0.20 s | stable |
+| 250 ms / 25 ms | 10× | — | queue overflow, session closed |
+
+For realtime audio, use:
+
+```text
+chunk size = 1000 ms
+interval   = 1000 ms
+```
+
+This minimizes per-message overhead while preserving realtime pacing.
+The observed one-die capacity is still about **10 concurrent realtime
+streams** (recommended 8 with latency headroom), because the diarization
+pipeline's internal 720 ms windows and request scheduler dominate.
+
+If the client is allowed to ingest faster than realtime, use **ACK
+backpressure** instead of a fixed interval: send the next 1000 ms chunk only
+after the previous `audio.ack`.  On one 310P3 this reaches about **11.3× real
+time** for a single stream.
+
+Run the chunk/interval sweep with:
+
+```bash
+.venv/bin/python benchmarks/npu/live_chunk_interval.py /tmp/jfk_10x.wav \
+  --url ws://127.0.0.1:18086/v1/audio/diarizations/stream \
+  --streams 1 --chunk-ms 1000 --interval-ms 0 \
+  --audio-seconds-per-stream 60
+```
+
 ## Known limitations
 
 - This is not an NVIDIA-supported CUDA configuration.  The CUDA path still
