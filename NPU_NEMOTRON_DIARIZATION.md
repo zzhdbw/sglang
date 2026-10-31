@@ -194,11 +194,23 @@ audio stream per connection.  Tests used one 310P3, `max_concurrency=1`,
 Interpretation for one 310P3 die:
 
 - **Recommended: 8 concurrent realtime streams**
-- **Measured ceiling: about 10 concurrent realtime streams**
+- **Measured ceiling: about 10–11 concurrent realtime streams**
+- At 11 streams the run may complete but wall time exceeds the 60 s input
+  duration (for example 62–64 s) and p95 ACK lag grows to 2–3.5 s, so it is no
+  longer clean realtime.  The fully sustainable point is therefore about 10.
+- Chunk size 250/500/1000 ms barely changes this concurrency ceiling because
+  the internal 720 ms diarization windows and per-request scheduler dominate.
+  Chunk size mainly changes message overhead and latency granularity.
 - Above 10, the per-session 8-message (2 s) audio queue starts filling and the
   server eventually closes sessions.
 - Raising `max_concurrency` to 4 did not help and made results worse on this
   CANN/torch_npu version; keep `max_concurrency=1` unless separately tuned.
+
+One Atlas 300I Duo card exposes **two** 310P3 dies, so a card-level estimate
+with two independent server processes is:
+
+- **Recommended: about 2 × 8 = 16 concurrent realtime streams per card**
+- **Measured ceiling: about 2 × 10 = 20 concurrent realtime streams per card**
 
 The full 300I Duo host exposes 8 × 310P3 dies.  With one server process pinned
 to each die, the first-order host capacity is therefore:
