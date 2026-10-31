@@ -195,6 +195,33 @@ end-to-end time.  See
 [`benchmarks/npu/PROFILE_NEMOTRON_DIARIZATION_NPU.md`](./benchmarks/npu/PROFILE_NEMOTRON_DIARIZATION_NPU.md)
 for the full profile.
 
+### Skip-mask attention optimization
+
+Full-window attention no longer materialises the all-true padding mask or runs
+`MaskedFill`; the mask path remains only for padded/partial windows.  On the
+same 8-file HK-DS3 evaluation set, the generated diarization segments were
+**exactly identical** to the previous service on every file, so DER did not
+change.
+
+Throughput changes on one tuned 310P3 (`OMP_NUM_THREADS=16`):
+
+| Workload | Before skip-mask | After skip-mask | Improvement |
+| --- | ---: | ---: | ---: |
+| 11.0 s upload, warm mean | 62.81 ms | **60.15 ms** | 1.04× |
+| 51.6 min upload, mean | 14.84 s | **11.87 s** | **1.25×** |
+| 51.6 min realtime factor | 208.7× | **260.8×** | +25% |
+| 8-file service time total | 87.26 s | **48.67 s** | 1.79× |
+
+Live 250 ms / 250 ms, 60-second 310P3 test:
+
+| Concurrent streams | Result |
+| ---: | --- |
+| 14 | stable, no errors, p95 ACK lag 0.90 s |
+| 15 | 4 sessions failed (queue full / connection closed) |
+
+The practical live ceiling improved from about **12** to about **14** streams
+per 310P3 die.
+
 ### Throughput after OMP tuning
 
 Measured on the tuned instance with `OMP_NUM_THREADS=16` and

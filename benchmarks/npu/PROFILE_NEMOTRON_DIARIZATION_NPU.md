@@ -105,6 +105,30 @@ This is a **1.38× end-to-end improvement** and reduces the bottleneck to:
 - communication: ~1.1 s
 - per-chunk CPU dispatch/D2H/misc: remainder
 
+## Skip-mask optimization result
+
+The attention implementation originally always ran:
+
+```python
+scores = scores.masked_fill(~mask, min_value)
+```
+
+For a full window, `valid_length == frame_count` and the mask is all true, so
+this operation is redundant.  The implementation now passes `mask=None` in
+that case and retains the masked path only for partial windows.
+
+Measured on the same 8 HK-DS3 meetings:
+
+- Generated diarization segments are **bit-for-bit identical** to the old
+  service outputs on all 8 files.
+- Therefore DER is **exactly unchanged**:
+  - aggregate NPU DER collar=0: 34.8009%
+  - aggregate NPU DER collar=0.25: 30.2840%
+- 51.6-minute request: 14.84 s → **11.87 s** (1.25× faster, 260.8× realtime).
+- 11-second warm request: 62.81 ms → **60.15 ms**.
+- Live 250 ms / 250 ms: stable concurrency increased from 12 to **14**
+  streams per die (15 starts failing).
+
 ## Conclusion
 
 - **Communication is not the bottleneck**: about 5–7%.

@@ -131,7 +131,10 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(512, 512)
 
     def forward(
-        self, hidden_states: torch.Tensor, rotary: RotaryEmbedding, mask: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        rotary: RotaryEmbedding,
+        mask: torch.Tensor | None,
     ) -> torch.Tensor:
         qkv = (
             self.w_qkv(hidden_states)
@@ -141,10 +144,13 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = rotary(q, k)
 
-        # Eager full attention.  The padding mask is shaped (1, frame_count) and
-        # broadcasts over query rows, batch and heads.
+        # Eager full attention.  The padding mask is shaped (1, frame_count)
+        # and broadcasts over query rows, batch and heads.  When the whole
+        # context is valid, skip materialising a mask and the MaskedFill
+        # kernel entirely; this is the common full-window path.
         scores = torch.matmul(q, k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
-        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        if mask is not None:
+            scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
         attention_weights = torch.softmax(scores, dim=-1)
         attention_output = torch.matmul(attention_weights, v)
 
@@ -176,7 +182,10 @@ class TransformerBlock(nn.Module):
         self.ffn = FeedForward()
 
     def forward(
-        self, hidden_states: torch.Tensor, rotary: RotaryEmbedding, mask: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        rotary: RotaryEmbedding,
+        mask: torch.Tensor | None,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states), rotary, mask
@@ -219,7 +228,14 @@ class TransformerEncoder(nn.Module):
         return mask
 
     def forward(self, embeddings: torch.Tensor, valid_length: int) -> torch.Tensor:
-        mask = self.attention_mask(embeddings.shape[1], valid_length)
+        frame_count = embeddings.shape[1]
+        # The common full-window path has no padding.  Avoid allocating the
+        # mask and the per-layer MaskedFill kernel in that case.
+        mask = (
+            None
+            if valid_length == frame_count
+            else self.attention_mask(frame_count, valid_length)
+        )
         hidden_states = self.embed_norm(embeddings)
         for layer in self.layers:
             hidden_states = layer(hidden_states, self.pos_enc, mask)
