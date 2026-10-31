@@ -49,18 +49,19 @@ def mixed_ffn_forward(self, hidden_states):
     return self.net(hidden_states.half()).float()
 
 
-def configure_mixed_precision(model):
-    """Attention/MLP weights+matmuls in FP16; norms/softmax FP32."""
+def configure_mixed_precision(model, *, attention=True, mlp=True):
+    """Selected attention/MLP weights+matmuls in FP16; norms/softmax FP32."""
     for layer in model.encoder.layers:
-        attn = layer.attn
-        attn.w_qkv.to(torch.float16)
-        attn.out_proj.to(torch.float16)
-        attn.forward = types.MethodType(mixed_attention_forward, attn)
-
-        ffn = layer.ffn
-        ffn.net[0].to(torch.float16)
-        ffn.net[3].to(torch.float16)
-        ffn.forward = types.MethodType(mixed_ffn_forward, ffn)
+        if attention:
+            attn = layer.attn
+            attn.w_qkv.to(torch.float16)
+            attn.out_proj.to(torch.float16)
+            attn.forward = types.MethodType(mixed_attention_forward, attn)
+        if mlp:
+            ffn = layer.ffn
+            ffn.net[0].to(torch.float16)
+            ffn.net[3].to(torch.float16)
+            ffn.forward = types.MethodType(mixed_ffn_forward, ffn)
 
 
 def run_file(model, audio_path: Path, mode: str) -> dict:
@@ -125,7 +126,11 @@ def run_file(model, audio_path: Path, mode: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("data_dir")
-    parser.add_argument("--mode", choices=("fp32", "fp16", "mixed", "amp"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("fp32", "fp16", "mixed", "amp", "attn_half", "mlp_half"),
+        required=True,
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--model-path",
@@ -142,6 +147,10 @@ def main() -> None:
         model.preprocessor.float()
     elif args.mode == "mixed":
         configure_mixed_precision(model)
+    elif args.mode == "attn_half":
+        configure_mixed_precision(model, attention=True, mlp=False)
+    elif args.mode == "mlp_half":
+        configure_mixed_precision(model, attention=False, mlp=True)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

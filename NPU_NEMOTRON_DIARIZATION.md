@@ -238,6 +238,22 @@ trade-off, but it regresses `AIPC` by 3.37 pp, so the production service
 remains FP32 + skip-mask.  See
 [`benchmarks/npu/PRECISION_SWEEP_NEMOTRON_DIARIZATION.md`](./benchmarks/npu/PRECISION_SWEEP_NEMOTRON_DIARIZATION.md).
 
+### CPU STFT / NPU overlap
+
+The 310P featurizer is CPU-only.  A chunked background feature producer now
+overlaps STFT/mel with NPU inference.  It is numerically identical to the
+original full-file STFT and leaves all 8 evaluation outputs bit-identical.
+
+| Workload | Before overlap | After overlap | Speedup |
+| --- | ---: | ---: | ---: |
+| 51.6 min service request, warm | ~11.6 s | **~9.7 s** | 1.20× |
+| 8-file service total | 48.67 s | **40.99 s** | 1.19× |
+| Realtime factor, 51.6 min | 267× | **319×** | +19% |
+
+See [`benchmarks/npu/OPTIMIZATION_ROUND_2.md`](./benchmarks/npu/OPTIMIZATION_ROUND_2.md)
+for the full second-round results, including fused attention, concurrency, and
+finer-grained FP16 experiments.
+
 ### Throughput after OMP tuning
 
 Measured on the tuned instance with `OMP_NUM_THREADS=16` and
