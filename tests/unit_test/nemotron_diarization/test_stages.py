@@ -162,7 +162,7 @@ def test_unsupported_deployments_fail_before_loading(
         raise LookupError("loaded")
 
     for device, profile, message in [
-        (torch.device("cpu"), "offline", "CUDA device"),
+        (torch.device("cpu"), "offline", "CUDA or Ascend NPU device"),
         (torch.device("cuda:0"), "live", "Unknown diarization profile"),
     ]:
         with pytest.raises(ValueError, match=message):
@@ -222,7 +222,12 @@ def test_failed_inference_waits_for_gpu_before_propagating_error(
     )
     monkeypatch.setattr(torch.cuda, "Stream", lambda device: Stream())
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    # Keep tensors on CPU while exercising the generic accelerator-stream
+    # bookkeeping path with the mocked torch.cuda module.
     worker = stages.DiarizationWorker(FailingModel(), torch.device("cpu"), 2, 1)
+    worker.device_module = torch.cuda
+    worker.thread_streams = threading.local()
+    worker.loaded = SimpleNamespace(record=lambda stream: None)
     errors: list[RuntimeError] = []
 
     def run() -> None:

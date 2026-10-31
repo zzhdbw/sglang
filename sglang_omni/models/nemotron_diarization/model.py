@@ -15,19 +15,15 @@ from threading import local
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 from torch import nn
-from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 from sglang_omni.models.nemotron_diarization.speaker_cache import SpeakerCache
+from sglang_omni.utils.device import has_device_streams
 
-# note (Richard Wang): Use deterministic compiler reductions without changing other models.
-compiled_flex_attention = torch.compile(
-    flex_attention,
-    dynamic=True,
-    options={"deterministic": True, "triton.autotune_pointwise": False},
-)
+# The upstream CUDA path uses a Triton rotary kernel and flex_attention.  Their
+# generated kernels are not available on Ascend 310P, so this fork uses a
+# numerically equivalent eager PyTorch path.  The model is small (100M params)
+# and windows are short, making eager attention practical on NPU.
 MASK_BLOCK_FRAMES = 128
 
 
@@ -39,6 +35,18 @@ class Featurizer(nn.Module):
         self.register_buffer("fb", torch.empty(1, 128, 257))
 
     def forward(self, waveform: torch.Tensor) -> tuple[torch.Tensor, int]:
+        device = waveform.device
+        if device.type == "npu":
+            # torch.stft emits complex tensors, which Ascend 310P/torch_npu does
+            # not support.  The feature extractor is only a small STFT, so run it
+            # on the host and move the real-valued mel features to the NPU.
+            waveform = waveform.cpu()
+            window = self.window.cpu()
+            fb = self.fb.cpu()
+        else:
+            window = self.window
+            fb = self.fb
+
         frame_count = waveform.shape[1] // 160
         emphasized = torch.cat(
             [waveform[:, :1], waveform[:, 1:] - 0.97 * waveform[:, :-1]], dim=1
@@ -48,15 +56,17 @@ class Featurizer(nn.Module):
             n_fft=512,
             hop_length=160,
             win_length=400,
-            window=self.window,
+            window=window,
             center=True,
             pad_mode="constant",
             return_complex=True,
         )
         # note (Ryan Stewart): Preserve the reference's sqrt/square rounding.
         magnitude = torch.sqrt(torch.view_as_real(spectrum).pow(2).sum(-1))
-        features = torch.log(torch.matmul(self.fb, magnitude.pow(2)) + 2**-24)
+        features = torch.log(torch.matmul(fb, magnitude.pow(2)) + 2**-24)
         features[:, :, frame_count:] = 0
+        if device.type == "npu":
+            features = features.to(device)
         return features, frame_count
 
 
@@ -80,50 +90,6 @@ class FeatureStacking(nn.Module):
         return self.proj(frames.reshape(1, -1, 8 * 128))
 
 
-@triton.jit(do_not_specialize=["q_batch", "k_batch", "o_batch"])
-def rotary_kernel(
-    q,
-    k,
-    cos,
-    sin,
-    q_out,
-    k_out,
-    q_batch,
-    q_head: tl.constexpr,
-    q_frame: tl.constexpr,
-    k_batch,
-    k_head: tl.constexpr,
-    k_frame: tl.constexpr,
-    o_batch,
-    o_head: tl.constexpr,
-    o_frame: tl.constexpr,
-    head_dim: tl.constexpr,
-    block: tl.constexpr,
-):
-    frame = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
-    column = tl.arange(0, block)
-    rotated = (column + head_dim // 2) % head_dim
-    sign = tl.where(column < head_dim // 2, -1.0, 1.0)
-    valid = column < head_dim
-    cosine = tl.load(cos + frame * head_dim + column, valid, other=0)
-    sine = tl.load(sin + frame * head_dim + column, valid, other=0)
-    q_base = batch * q_batch + head * q_head + frame * q_frame
-    k_base = batch * k_batch + head * k_head + frame * k_frame
-    out_base = batch * o_batch + head * o_head + frame * o_frame
-    q_value = tl.load(q + q_base + column, valid, other=0)
-    q_other = tl.load(q + q_base + rotated, valid, other=0)
-    k_value = tl.load(k + k_base + column, valid, other=0)
-    k_other = tl.load(k + k_base + rotated, valid, other=0)
-    tl.store(
-        q_out + out_base + column, q_value * cosine + (sign * q_other) * sine, valid
-    )
-    tl.store(
-        k_out + out_base + column, k_value * cosine + (sign * k_other) * sine, valid
-    )
-
-
 class RotaryEmbedding(nn.Module):
     def __init__(self, max_frames: int) -> None:
         super().__init__()
@@ -145,30 +111,17 @@ class RotaryEmbedding(nn.Module):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply NeOX rotation with separate FP32 products and addition."""
-        batch, heads, frames, head_dim = q.shape
-        # note (Richard Wang): The kernel reads table rows by frame without a bound check.
+        """Apply NeOX rotation with separate products and addition."""
+        frames = q.shape[2]
         assert frames <= len(self.cos), f"{frames} frames exceed the rotary table"
-        size = (batch, heads, frames, head_dim)
-        stride = (frames * heads * head_dim, head_dim, heads * head_dim, 1)
-        q_out, k_out = (q.new_empty_strided(size, stride) for _ in range(2))
-        with torch.cuda.device(q.device):
-            # note (Richard Wang): Fusion changes the FP32 reference rounding.
-            rotary_kernel[(frames, heads, batch)](
-                q,
-                k,
-                self.cos,
-                self.sin,
-                q_out,
-                k_out,
-                *q.stride()[:3],
-                *k.stride()[:3],
-                *q_out.stride()[:3],
-                head_dim,
-                triton.next_power_of_2(head_dim),
-                enable_fp_fusion=False,
-            )
-        return q_out, k_out
+        cos = self.cos[:frames].to(device=q.device, dtype=q.dtype)[None, None]
+        sin = self.sin[:frames].to(device=q.device, dtype=q.dtype)[None, None]
+
+        def rotate_half(x: torch.Tensor) -> torch.Tensor:
+            half = x.shape[-1] // 2
+            return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+        return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
 
 
 class Attention(nn.Module):
@@ -178,7 +131,7 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(512, 512)
 
     def forward(
-        self, hidden_states: torch.Tensor, rotary: RotaryEmbedding, mask: BlockMask
+        self, hidden_states: torch.Tensor, rotary: RotaryEmbedding, mask: torch.Tensor
     ) -> torch.Tensor:
         qkv = (
             self.w_qkv(hidden_states)
@@ -187,11 +140,14 @@ class Attention(nn.Module):
         )
         q, k, v = qkv.unbind(0)
         q, k = rotary(q, k)
-        # note (Richard Wang): Tile by window length only and keep the 64-row FP32 summation order.
-        block_rows = 16 if hidden_states.shape[1] < MASK_BLOCK_FRAMES else 64
-        attention_output = compiled_flex_attention(
-            q, k, v, block_mask=mask, kernel_options={"BLOCK_M": block_rows}
-        )
+
+        # Eager full attention.  The padding mask is shaped (1, frame_count) and
+        # broadcasts over query rows, batch and heads.
+        scores = torch.matmul(q, k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        attention_weights = torch.softmax(scores, dim=-1)
+        attention_output = torch.matmul(attention_weights, v)
+
         return self.out_proj(
             attention_output.transpose(1, 2)
             .contiguous()
@@ -220,22 +176,12 @@ class TransformerBlock(nn.Module):
         self.ffn = FeedForward()
 
     def forward(
-        self, hidden_states: torch.Tensor, rotary: RotaryEmbedding, mask: BlockMask
+        self, hidden_states: torch.Tensor, rotary: RotaryEmbedding, mask: torch.Tensor
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states), rotary, mask
         )
         return hidden_states + self.ffn(self.norm2(hidden_states))
-
-
-def block_mask_rows(blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the per-row block counts and the block indices that come first."""
-    return (
-        blocks.sum(-1).to(torch.int32)[None, None],
-        blocks.to(torch.int32)
-        .argsort(descending=True, stable=True)
-        .to(torch.int32)[None, None],
-    )
 
 
 class TransformerEncoder(nn.Module):
@@ -249,48 +195,28 @@ class TransformerEncoder(nn.Module):
         # note (Richard Wang): Per-thread masks stay on that worker thread's stream.
         self.thread_masks = local()
 
-    def attention_mask(self, frame_count: int, valid_length: int) -> BlockMask:
+    def attention_mask(self, frame_count: int, valid_length: int) -> torch.Tensor:
         masks = getattr(self.thread_masks, "masks", None)
         if masks is None:
             masks = self.thread_masks.masks = OrderedDict()
         else:
             pass
-        mask_key = (frame_count, valid_length)
+        mask_key = (frame_count, valid_length, str(self.final_norm.weight.device))
         if mask_key in masks:
             masks.move_to_end(mask_key)
             return masks[mask_key]
         else:
             pass
         device = self.final_norm.weight.device
-        valid_lengths = torch.tensor([valid_length], device=device)
-
-        def padding_mask(
-            batch: torch.Tensor,
-            head: torch.Tensor,
-            query_index: torch.Tensor,
-            key_value_index: torch.Tensor,
-        ) -> torch.Tensor:
-            return key_value_index < valid_lengths[batch]
-
-        # note (Richard Wang): Derive prefix blocks without a dense token mask.
-        blocks = torch.arange(-(-frame_count // MASK_BLOCK_FRAMES), device="cpu")
-        full = ((blocks[:, None] + 1) * MASK_BLOCK_FRAMES <= frame_count) & (
-            (blocks[None, :] + 1) * MASK_BLOCK_FRAMES <= valid_length
-        )
-        partial = (blocks[None, :] * MASK_BLOCK_FRAMES < valid_length) & ~full
-        masks[mask_key] = BlockMask.from_kv_blocks(
-            *block_mask_rows(partial),
-            *block_mask_rows(full),
-            BLOCK_SIZE=MASK_BLOCK_FRAMES,
-            mask_mod=padding_mask,
-            seq_lengths=(frame_count, frame_count),
-            compute_q_blocks=False,
-        ).to(device)
+        # Only keys beyond valid_length are padding.  A (1, frame_count) mask
+        # broadcasts across all query rows and attention heads.
+        mask = torch.arange(frame_count, device=device)[None, :] < valid_length
+        masks[mask_key] = mask
         if len(masks) > 128:
             masks.popitem(last=False)
         else:
             pass
-        return masks[mask_key]
+        return mask
 
     def forward(self, embeddings: torch.Tensor, valid_length: int) -> torch.Tensor:
         mask = self.attention_mask(embeddings.shape[1], valid_length)
@@ -365,11 +291,13 @@ class NemotronDiarizationModel(nn.Module):
         else:
             pass
         for start_frame in range(0, frame_count, chunk_size * 8):
-            if features.is_cuda:
-                # note (Richard Wang): The next window may run on another worker stream.
-                stream = torch.cuda.current_stream(features.device)
+            if has_device_streams(features.device):
+                # The next window may run on another worker stream.
+                device_module = torch.get_device_module(features.device)
+                stream = device_module.current_stream(features.device)
                 for tensor in (features, state.cache, state.fifo, state.cache_preds):
-                    tensor.record_stream(stream)
+                    if hasattr(tensor, "record_stream"):
+                        tensor.record_stream(stream)
             else:
                 pass
             end_frame = min(start_frame + chunk_size * 8, frame_count)

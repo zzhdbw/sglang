@@ -14,6 +14,13 @@
 
 --------------------------------------------------------------------------------
 
+> **Ascend NPU fork:** This checkout adds a validated Ascend 310P / Atlas 300I
+> Duo port of the native Nemotron-3-Diarization pipeline. See
+> [`NPU_NEMOTRON_DIARIZATION.md`](./NPU_NEMOTRON_DIARIZATION.md) for install,
+> serving, and verification commands.
+
+--------------------------------------------------------------------------------
+
 <p align="center">
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
 <a href="https://sgl-project.github.io/sglang-omni/"><b>Documentation</b></a> |

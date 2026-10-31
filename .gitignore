@@ -70,3 +70,6 @@ target/
 # CPU installer lock/backup
 .pyproject.cpu.lock
 .pyproject.cpu.bak
+
+# Ascend / torch_npu compilation artifacts
+kernel_meta/

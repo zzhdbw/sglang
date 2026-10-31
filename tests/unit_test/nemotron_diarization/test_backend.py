@@ -11,8 +11,6 @@ import numpy as np
 import pytest
 import torch
 import yaml
-from torch._inductor import config as inductor_config
-
 from sglang_omni.models.nemotron_diarization import model
 from sglang_omni.models.nemotron_diarization.backend import (
     REQUIRED_CONFIG,
@@ -143,20 +141,14 @@ def test_reused_attention_masks_preserve_each_valid_length() -> None:
     positions = torch.arange(9)
     for valid_length in [9, 3, 8, 3, 9]:
         mask = encoder.attention_mask(9, valid_length)
-        actual = mask.mask_mod(0, 0, 0, positions)
-        torch.testing.assert_close(actual, positions < valid_length)
+        torch.testing.assert_close(mask, (positions < valid_length)[None, :])
 
 
-@pytest.mark.parametrize("deterministic", [False, True])
-def test_model_compiler_policy_leaves_other_models_unchanged(
-    deterministic: bool,
-) -> None:
-    with inductor_config.patch(
-        {"deterministic": deterministic, "triton.autotune_pointwise": True}
-    ):
-        importlib.reload(model)
-        assert inductor_config.deterministic is deterministic
-        assert inductor_config.triton.autotune_pointwise is True
-        config = model.compiled_flex_attention.get_compiler_config()
-        assert config["deterministic"] is True
-        assert config["triton.autotune_pointwise"] is False
+def test_npu_compatible_attention_path_uses_eager_mask() -> None:
+    # The Ascend 310P port replaces flex_attention and its compiled Triton
+    # kernel with dense eager attention and a boolean padding mask.
+    assert not hasattr(model, "compiled_flex_attention")
+    encoder = TransformerEncoder(max_frames=16)
+    mask = encoder.attention_mask(16, 11)
+    assert mask.dtype is torch.bool
+    assert mask.shape == (1, 16)

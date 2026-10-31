@@ -1,0 +1,2 @@
+config_cls: NemotronDiarizationPipelineConfig
+model_path: /workspace/models/Nemotron-3-Diarization/Nemotron-3-Diarization.nemo

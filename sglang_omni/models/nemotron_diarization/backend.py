@@ -189,10 +189,19 @@ def load_diarization_model(
         raise ValueError(
             f"Unknown diarization profile {profile!r}, use one of {list(PROFILES)}"
         )
-    elif device.type != "cuda":
-        raise ValueError("Nemotron 3 diarization requires an NVIDIA CUDA device")
+    elif device.type not in {"cuda", "npu"}:
+        raise ValueError(
+            "Nemotron 3 diarization requires an NVIDIA CUDA or Ascend NPU device"
+        )
     else:
         pass
+    if device.type == "npu":
+        # The default JIT/AOT mode recompiles for the many dynamic prefix
+        # lengths used by streaming inference.  Binary mode avoids those
+        # multi-second to multi-minute stalls on Ascend 310P.
+        import torch_npu
+
+        torch.npu.set_compile_mode(jit_compile=False)
     checkpoint = resolve_nemo_checkpoint(model_path)
     validate_checkpoint(checkpoint)
     with torch.device("meta"):
